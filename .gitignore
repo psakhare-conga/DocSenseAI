@@ -5,7 +5,7 @@ node_modules/
 dist/
 
 # Environment secrets — NEVER commit these
-mock-api/.env
+api/.env
 
 # Logs
 logs/

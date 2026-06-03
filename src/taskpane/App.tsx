@@ -276,7 +276,7 @@ export default function App() {
         {
           id: `err-${Date.now()}`,
           role: "assistant",
-          text: "Could not reach the API. Make sure the mock API server is running:\n  cd mock-api && npm start"
+          text: "Could not reach the API. Make sure the API server is running:\n  cd api && npm start"
         }
       ]);
     } finally {
