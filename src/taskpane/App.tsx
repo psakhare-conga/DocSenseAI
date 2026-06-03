@@ -68,6 +68,7 @@ export default function App() {
   const [officeReady, setOfficeReady] = useState(false);
   const [showClauses, setShowClauses] = useState(false);
   const [threadId, setThreadId] = useState<string | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -88,6 +89,35 @@ export default function App() {
   }, [messages]);
 
   // ── Read content controls from the open Word document ────────────────────
+
+  // ── Silently re-read content controls without posting a system message ──────
+  // Used after updates/inserts to keep state fresh without spamming the chat.
+  const refreshContentControls = async () => {
+    try {
+      await Word.run(async (context) => {
+        const ccs = context.document.contentControls;
+        ccs.load("items/id,items/tag,items/title,items/text,items/cannotEdit,items/cannotDelete,items/placeholderText");
+        await context.sync();
+
+        const CONGA_TYPES = new Set(["clause", "field", "repeat", "segment"]);
+        const loaded: ContentControl[] = ccs.items
+          .filter((cc) => cc.tag || CONGA_TYPES.has((cc.title || "").toLowerCase()))
+          .map((cc) => ({
+            id: cc.id,
+            tag: cc.tag || "",
+            title: cc.tag
+              ? `${cc.tag}${cc.title ? " (" + cc.title + ")" : ""}`
+              : cc.title || "Unnamed",
+            text: cc.text || "",
+            type: cc.title || "",
+            cannotEdit: cc.cannotEdit || false,
+            cannotDelete: cc.cannotDelete || false,
+            placeholderText: cc.placeholderText || ""
+          }));
+        setContentControls(loaded);
+      });
+    } catch { /* silent — non-critical */ }
+  };
 
   const loadDocumentMetadata = async () => {
     setThreadId(null); // new document load = fresh conversation session
@@ -111,7 +141,7 @@ export default function App() {
             title: cc.tag
               ? `${cc.tag}${cc.title ? " (" + cc.title + ")" : ""}`
               : cc.title || "Unnamed",
-            text: cc.text ? cc.text.substring(0, 300) : "",
+            text: cc.text || "",
             type: cc.title || "",
             cannotEdit: cc.cannotEdit || false,
             cannotDelete: cc.cannotDelete || false,
@@ -160,7 +190,7 @@ export default function App() {
         para.font.bold = false;
         await context.sync();
         addSystemMessage(`✅ New clause "${action.tag}" inserted at the end of the document.`);
-        loadDocumentMetadata();
+        refreshContentControls();
       });
     } catch (err) {
       addSystemMessage(`Failed to insert clause: ${err}`);
@@ -192,7 +222,7 @@ export default function App() {
           wordCc.insertText(" " + action.replace, "End");
           await context.sync();
           addSystemMessage(`\u2705 Inserted "${action.replace}" at the end of "${cc.tag}"`);
-          loadDocumentMetadata();
+          refreshContentControls();
           return;
         }
         const updated  = original.replace(
@@ -209,8 +239,8 @@ export default function App() {
         await context.sync();
         addSystemMessage(`✅ Updated: "${action.find}" → "${action.replace}" in "${cc.tag}"`);
 
-        // Refresh the content controls state with new text
-        loadDocumentMetadata();
+        // Silently refresh content controls state with new text
+        refreshContentControls();
       });
     } catch (err) {
       addSystemMessage(`Failed to update clause: ${err}`);
@@ -223,21 +253,24 @@ export default function App() {
       { id: `sys-${Date.now()}`, role: "system", text }
     ]);
 
-  // ── Send a chat message to the API ────────────────────────────────────────
+  // ── Send a chat message to the API (streaming) ────────────────────────────
 
   const sendMessage = async () => {
     const text = input.trim();
     if (!text || loading) return;
 
     setInput("");
+    const assistantMsgId = `a-${Date.now()}`;
+
     setMessages((prev) => [
       ...prev,
       { id: `u-${Date.now()}`, role: "user", text }
     ]);
     setLoading(true);
+    setIsStreaming(false);
 
     try {
-      const response = await fetch(`${API_URL}/api/chat`, {
+      const response = await fetch(`${API_URL}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -248,31 +281,78 @@ export default function App() {
         })
       });
 
-      if (!response.ok) throw new Error(`API ${response.status}`);
+      if (!response.ok || !response.body) throw new Error(`API ${response.status}`);
 
-      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; threadId?: string } = await response.json();
-      if (data.threadId) setThreadId(data.threadId);
+      const reader  = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer       = "";
+      let streamedText = "";
+      let placeholderAdded = false;
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          role: "assistant",
-          text: data.reply || (data.updateAction ? `Updating "${data.updateAction.find}" → "${data.updateAction.replace}" in ${data.updateAction.tag}…` : data.insertAction ? `Inserting clause "${data.insertAction.tag}"…` : "Done."),
-          contentControlId: data.contentControlId
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          if (!part.startsWith("data: ")) continue;
+          let event: { type: string; text?: string; reply?: string; threadId?: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; message?: string };
+          try { event = JSON.parse(part.slice(6)); } catch { continue; }
+
+          if (event.type === "token") {
+            streamedText += event.text ?? "";
+            if (!placeholderAdded) {
+              // First token — add the placeholder message and start streaming
+              placeholderAdded = true;
+              setIsStreaming(true);
+              setMessages((prev) => [
+                ...prev,
+                { id: assistantMsgId, role: "assistant", text: streamedText }
+              ]);
+            } else {
+              setMessages((prev) =>
+                prev.map((m) => m.id === assistantMsgId ? { ...m, text: streamedText } : m)
+              );
+            }
+
+          } else if (event.type === "done") {
+            const finalText = event.reply ?? streamedText;
+            if (!placeholderAdded) {
+              // No tokens were streamed (e.g. keyword fallback) — add message now
+              setMessages((prev) => [
+                ...prev,
+                { id: assistantMsgId, role: "assistant", text: finalText, contentControlId: event.contentControlId }
+              ]);
+            } else {
+              // Replace streamed text with clean reply (action JSON stripped out)
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId
+                    ? { ...m, text: finalText, contentControlId: event.contentControlId }
+                    : m
+                )
+              );
+            }
+
+            if (event.threadId) setThreadId(event.threadId);
+            if (event.contentControlId) await navigateToClause(event.contentControlId);
+            if (event.updateAction)     await updateClause(event.updateAction);
+            if (event.insertAction)     await insertClause(event.insertAction);
+
+          } else if (event.type === "error") {
+            const errText = event.message ?? "An error occurred. Please try again.";
+            if (!placeholderAdded) {
+              setMessages((prev) => [...prev, { id: assistantMsgId, role: "assistant", text: errText }]);
+            } else {
+              setMessages((prev) =>
+                prev.map((m) => m.id === assistantMsgId ? { ...m, text: errText } : m)
+              );
+            }
+          }
         }
-      ]);
-
-      if (data.contentControlId) {
-        await navigateToClause(data.contentControlId);
-      }
-
-      if (data.updateAction) {
-        await updateClause(data.updateAction);
-      }
-
-      if (data.insertAction) {
-        await insertClause(data.insertAction);
       }
     } catch {
       setMessages((prev) => [
@@ -285,6 +365,7 @@ export default function App() {
       ]);
     } finally {
       setLoading(false);
+      setIsStreaming(false);
       inputRef.current?.focus();
     }
   };
@@ -398,8 +479,8 @@ export default function App() {
           </div>
         ))}
 
-        {/* Typing indicator */}
-        {loading && (
+        {/* Typing indicator — shown while connecting, hidden once tokens arrive */}
+        {loading && !isStreaming && (
           <div className="message message-assistant">
             <div className="message-bubble typing">
               <span />

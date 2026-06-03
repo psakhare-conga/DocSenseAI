@@ -364,7 +364,7 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
     const name    = cc.tag   || cc.title || "Unnamed";
-    const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
+    const preview = cc.text  || "(no text)";
 
     // Surface key metadata flags so the AI understands the contract state
     const flags = [
@@ -386,14 +386,14 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
     ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}`
     : "";
 
-  const docSnippet = docText ? docText.substring(0, 3000) : "";
+  const docSnippet = docText || "";
 
   return `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
 ${documentProps ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}\n` : ""}
 The document currently open has the following content controls (clauses and fields):
 ${ccLines || "(none detected yet)"}
 
-Full document text (first 3000 chars):
+Full document text:
 ${docSnippet || "(not available)"}
 
 Your job:
@@ -418,7 +418,7 @@ function buildDocumentContext(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
     const name    = cc.tag   || cc.title || "Unnamed";
-    const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
+    const text    = cc.text  || "(no text)";
     const flags = [
       cc.SubType             ? `SubType:${cc.SubType}`                : null,
       cc.SFObjectName        ? `Object:${cc.SFObjectName}`            : null,
@@ -429,21 +429,16 @@ function buildDocumentContext(contentControls, docText, documentProps) {
       cc.MarkedForDeletion === "true" ? "MarkedForDeletion"           : null,
       cc.Action              ? `Action:${cc.Action}`                  : null,
     ].filter(Boolean).join(", ");
-    return `- "${name}" [${type}]${flags ? ` (${flags})` : ""}: ${preview}`;
+    return `- "${name}" [${type}]${flags ? ` (${flags})` : ""}: ${text}`;
   }).join("\n");
 
   const docPropsSection = documentProps
     ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k, v]) => `  ${k}: ${v}`).join("\n")}`
     : "";
 
-  const docSnippet = docText ? docText.substring(0, 3000) : "";
-
   return `[CURRENT DOCUMENT CONTEXT — use this to answer the user]${docPropsSection}
 Content controls (clauses and fields) in the open document:
-${ccLines || "(none detected — make sure a Conga contract document is open in Word)"}
-
-Full document text (first 3000 chars):
-${docSnippet || "(not available)"}`;
+${ccLines || "(none detected — make sure a Conga contract document is open in Word)"}`;
 }
 
 // ── Parse action JSON block from AI reply ─────────────────────────────────────
@@ -665,6 +660,154 @@ app.post("/api/chat", async (req, res) => {
   res.json({
     reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`
   });
+});
+
+// ── POST /api/chat/stream ─────────────────────────────────────────────────────
+// Streaming version of /api/chat — uses Server-Sent Events (SSE).
+// Tokens are emitted as {"type":"token","text":"..."} and the final event is
+// {"type":"done","reply":"...","threadId":"...","action":{...}} (action is optional).
+// The frontend reads the stream with fetch + ReadableStream and renders tokens live.
+
+app.post("/api/chat/stream", async (req, res) => {
+  const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
+  let threadId = reqThreadId;
+  const reqId = Date.now().toString(36);
+
+  // Set SSE headers immediately so the browser can start reading
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const sendEvent = (data) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  const endStream = () => { if (!res.writableEnded) res.end(); };
+
+  // ── Agent path (Assistants API streaming) ──────────────────────────────────
+  if (assistantsClient && AZURE_AGENT_ID) {
+    try {
+      if (!threadId) {
+        const thread = await assistantsClient.beta.threads.create();
+        threadId = thread.id;
+      }
+
+      await assistantsClient.beta.threads.messages.create(threadId, {
+        role: "user",
+        content: message
+      });
+
+      const docContext = buildDocumentContext(contentControls, docText, null);
+      let fullText = "";
+
+      const runStream = assistantsClient.beta.threads.runs.stream(threadId, {
+        assistant_id: AZURE_AGENT_ID,
+        additional_instructions: docContext
+      });
+
+      runStream.on("textDelta", (delta) => {
+        const token = delta.value || "";
+        if (token) {
+          fullText += token;
+          sendEvent({ type: "token", text: token });
+        }
+      });
+
+      runStream.on("error", (err) => {
+        logger.error("AGENT_STREAM_ERR", { message: `Agent stream error [${reqId}]`, reqId, error: err.message });
+        sendEvent({ type: "error", message: "Stream error — please try again." });
+        endStream();
+      });
+
+      await runStream.finalRun();
+
+      const action     = parseActionFromReply(fullText);
+      const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
+      const done = { type: "done", reply: cleanReply, threadId };
+
+      if (action?.action === "navigate") {
+        const found = findClause(action.tag, contentControls);
+        done.navigateTo       = action.tag;
+        done.contentControlId = found?.id;
+      }
+      if (action?.action === "update") {
+        done.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+      }
+      if (action?.action === "insert") {
+        done.insertAction = { tag: action.tag, text: action.text };
+      }
+
+      sendEvent(done);
+      endStream();
+      return;
+
+    } catch (err) {
+      logger.error("AGENT_STREAM_FAIL", { message: `Agent stream failed [${reqId}], falling back`, reqId, error: err.message });
+      // Fall through to chat.completions
+    }
+  }
+
+  // ── chat.completions path (streaming) ──────────────────────────────────────
+  if (aiClient) {
+    try {
+      const systemPrompt = buildSystemPrompt(contentControls, docText, null);
+      let fullText = "";
+
+      const stream = await aiClient.chat.completions.create({
+        model: AZURE_DEPLOYMENT,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: message }
+        ],
+        temperature: 0.2,
+        max_tokens: 800,
+        stream: true
+      });
+
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content || "";
+        if (token) {
+          fullText += token;
+          sendEvent({ type: "token", text: token });
+        }
+      }
+
+      const action     = parseActionFromReply(fullText);
+      const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
+      const done = { type: "done", reply: cleanReply };
+
+      if (action?.action === "navigate") {
+        const found = findClause(action.tag, contentControls);
+        done.navigateTo       = action.tag;
+        done.contentControlId = found?.id;
+      }
+      if (action?.action === "update") {
+        done.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+      }
+      if (action?.action === "insert") {
+        done.insertAction = { tag: action.tag, text: action.text };
+      }
+
+      sendEvent(done);
+      endStream();
+      return;
+
+    } catch (err) {
+      logger.error("COMPLETIONS_STREAM_FAIL", { message: `Completions stream failed [${reqId}]`, reqId, error: err.message });
+      sendEvent({ type: "error", message: "AI error — please try again." });
+      endStream();
+      return;
+    }
+  }
+
+  // ── Keyword fallback (no AI) ───────────────────────────────────────────────
+  const msg_lc = message.toLowerCase();
+  let fallbackReply = `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"`;
+  if (msg_lc.includes("list") || msg_lc.includes("all clause") || msg_lc.includes("show clause")) {
+    fallbackReply = formatClauseList(contentControls);
+  }
+  sendEvent({ type: "done", reply: fallbackReply });
+  endStream();
 });
 
 // ── POST /api/metadata ────────────────────────────────────────────────────────
