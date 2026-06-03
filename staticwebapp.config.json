@@ -1,0 +1,14 @@
+{
+  "navigationFallback": {
+    "rewrite": "/taskpane.html",
+    "exclude": ["/*.{js,css,png,ico,html}", "/assets/*"]
+  },
+  "mimeTypes": {
+    ".xml": "application/xml"
+  },
+  "globalHeaders": {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin"
+  }
+}

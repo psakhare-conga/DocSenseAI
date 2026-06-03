@@ -1,0 +1,379 @@
+<Document xmlns="http://www.apttus.com/externalmetadata">
+  <Fields>
+    <Field xmlns="" id="971925"/>
+    <Field xmlns="" id="6930"/>
+    <Field xmlns="" id="474883"/>
+  </Fields>
+  <Clauses>
+    <Clause id="6216"/>
+    <Clause id="4768"/>
+    <Clause id="5383"/>
+    <Clause id="3928"/>
+  <Clause id="7152"/><Clause id="8900"/></Clauses>
+  <Tables/>
+  <Sections>
+    <Section Number="1">
+      <Row name="1" id="0981031d-a106-4c81-87a5-05dc299f070c">
+        <Fields>
+          <Field id="1555351587"/>
+          <Field id="2005327024"/>
+          <Field id="920891306"/>
+        </Fields>
+        <Tables/>
+      </Row>
+    </Section>
+    <Section Number="3">
+      <Row name="1" id="914d926d-001e-435f-963f-479e2c2b8ee5">
+        <Fields>
+          <Field id="363803"/>
+          <Field id="671695"/>
+          <Field id="583444"/>
+          <Field id="426463"/>
+        </Fields>
+        <Tables>
+          <Table id="451366" TableInst="1" SectionInst="2" SectionNum="3">
+            <RowHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Name</Tag>
+                  <SubType>String</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Name</SFSource>
+                  <SFSourceAPI>Name</SFSourceAPI>
+                  <RenderAs>String</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>-1115205196</id>
+                  <displayTag>Name</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Quantity</Tag>
+                  <SubType>Double</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Quantity_c</SFSource>
+                  <SFSourceAPI>Device_Quantity_c</SFSourceAPI>
+                  <RenderAs>Double</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>False</Smart>
+                  <Readonly>False</Readonly>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device List Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_List_Price_c</SFSource>
+                  <SFSourceAPI>Device_List_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>1684700538</id>
+                  <displayTag>Device List Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Extended Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Extended_Price_c</SFSource>
+                  <SFSourceAPI>Device_Extended_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>False</Smart>
+                  <Readonly>True</Readonly>
+                  <id>1765648816</id>
+                  <displayTag>Device Extended Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Base Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Base_Price_c</SFSource>
+                  <SFSourceAPI>Device_Base_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>773524880</id>
+                  <displayTag>Device Base Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                </Metadata>
+              </FieldHeader>
+            </RowHeader>
+            <Row>
+              <Field id="757396"/>
+              <Field id=""/>
+              <Field id="428564"/>
+              <Field id="147802"/>
+              <Field id="641362"/>
+            </Row>
+          </Table>
+        </Tables>
+      </Row>
+    </Section>
+  <Section Number="3">
+      <Row name="1" id="914d926d-001e-435f-963f-479e2c2b8ee5">
+        <Fields>
+          <Field id="715263"/>
+          <Field id="726407"/>
+          <Field id="378044"/>
+          <Field id="442506"/>
+          <Field id="106932"/>
+        </Fields>
+        <Tables>
+          <Table id="841578" TableInst="1" SectionInst="2" SectionNum="3">
+            <RowHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Name</Tag>
+                  <SubType>String</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Name</SFSource>
+                  <SFSourceAPI>Name</SFSourceAPI>
+                  <RenderAs>String</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>-1446457002</id>
+                  <displayTag>Name</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                  <MarkClauseReplacedPreviousWordOpenXML/>
+                  <BaseValue/>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Quantity</Tag>
+                  <SubType>Double</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Quantity_c</SFSource>
+                  <SFSourceAPI>Device_Quantity_c</SFSourceAPI>
+                  <RenderAs>Double</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>-1246110154</id>
+                  <displayTag>Device Quantity</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                  <MarkClauseReplacedPreviousWordOpenXML/>
+                  <BaseValue/>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device List Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_List_Price_c</SFSource>
+                  <SFSourceAPI>Device_List_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>False</Smart>
+                  <Readonly>True</Readonly>
+                  <id>-390501025</id>
+                  <displayTag>Device List Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                  <MarkClauseReplacedPreviousWordOpenXML/>
+                  <BaseValue/>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Extended Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Extended_Price_c</SFSource>
+                  <SFSourceAPI>Device_Extended_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>1072390749</id>
+                  <displayTag>Device Extended Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                  <MarkClauseReplacedPreviousWordOpenXML/>
+                  <BaseValue/>
+                </Metadata>
+              </FieldHeader>
+              <FieldHeader>
+                <Metadata>
+                  <Type>Field</Type>
+                  <Tag>Device Base Price</Tag>
+                  <SubType>Currency</SubType>
+                  <SFObjectName>XA_PlanDevice_c</SFObjectName>
+                  <SFIsReference>False</SFIsReference>
+                  <SFIsDBReference>False</SFIsDBReference>
+                  <SFParentObjectName>XA_Service_Plan_c</SFParentObjectName>
+                  <SFIsUpdatable>True</SFIsUpdatable>
+                  <SFSource>XA_PlanDevice_c/Device_Base_Price_c</SFSource>
+                  <SFSourceAPI>Device_Base_Price_c</SFSourceAPI>
+                  <RenderAs>Currency</RenderAs>
+                  <ImageHeight>5</ImageHeight>
+                  <ImageWidth>7</ImageWidth>
+                  <ConditionSerialized/>
+                  <ConditionExpression/>
+                  <ConditionSOQLStyle/>
+                  <ConditionCQLStyle/>
+                  <Smart>True</Smart>
+                  <Readonly>False</Readonly>
+                  <id>1174991350</id>
+                  <displayTag>Device Base Price</displayTag>
+                  <isDuplicate>false</isDuplicate>
+                  <DefaultLocale>en-US</DefaultLocale>
+                  <DefaultDateFormat>M/d/yyyy</DefaultDateFormat>
+                  <DefaultUseSymbolForFormatting>None</DefaultUseSymbolForFormatting>
+                  <DefaultPrecision>5</DefaultPrecision>
+                  <MarkClauseReplacedPreviousWordOpenXML/>
+                  <BaseValue/>
+                </Metadata>
+              </FieldHeader>
+            </RowHeader>
+            <Row>
+              <Field id="692225"/>
+              <Field id="223039"/>
+              <Field id="385720"/>
+              <Field id="396830"/>
+              <Field id="758628"/>
+            </Row>
+          </Table>
+        </Tables>
+      </Row>
+    </Section></Sections>
+</Document>
