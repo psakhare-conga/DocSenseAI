@@ -12,17 +12,17 @@
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="DocSense AI"/>
   <Description DefaultValue="AI-powered clause intelligence for Conga contracts"/>
-  <IconUrl DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/assets/icon-32.png"/>
-  <HighResolutionIconUrl DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/assets/icon-80.png"/>
-  <SupportUrl DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net"/>
+  <IconUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-80.png"/>
+  <SupportUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net"/>
   <AppDomains>
-    <AppDomain>https://victorious-ocean-015f4c30f.7.azurestaticapps.net</AppDomain>
+    <AppDomain>https://blue-mushroom-008de5a0f.7.azurestaticapps.net</AppDomain>
   </AppDomains>
   <Hosts>
     <Host Name="Document"/>
   </Hosts>
   <DefaultSettings>
-    <SourceLocation DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/taskpane.html"/>
+    <SourceLocation DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/taskpane.html"/>
   </DefaultSettings>
   <Permissions>ReadWriteDocument</Permissions>
 
@@ -69,15 +69,15 @@
     </Hosts>
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/assets/icon-16.png"/>
-        <bt:Image id="Icon.32x32" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/assets/icon-32.png"/>
-        <bt:Image id="Icon.80x80" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/assets/icon-80.png"/>
+        <bt:Image id="Icon.16x16" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-16.png"/>
+        <bt:Image id="Icon.32x32" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-32.png"/>
+        <bt:Image id="Icon.80x80" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-80.png"/>
       </bt:Images>
       <bt:Urls>
         <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://go.microsoft.com/fwlink/?LinkId=276812"/>
-        <bt:Url id="Commands.Url" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/commands.html"/>
-        <bt:Url id="Taskpane.Url" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net/taskpane.html"/>
-        <bt:Url id="LearnMoreUrl" DefaultValue="https://victorious-ocean-015f4c30f.7.azurestaticapps.net"/>
+        <bt:Url id="Commands.Url" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/commands.html"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/taskpane.html"/>
+        <bt:Url id="LearnMoreUrl" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net"/>
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="GetStarted.Title" DefaultValue="DocSense AI is ready!"/>
