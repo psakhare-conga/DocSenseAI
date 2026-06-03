@@ -6,7 +6,7 @@
     "install-certs": "office-addin-dev-certs install --machine",
     "start": "webpack serve --mode development",
     "build": "webpack --mode production",
-    "postbuild": "node -e \"require('fs').copyFileSync('staticwebapp.config.json','dist/staticwebapp.config.json')\"",
+    "postbuild": "node -e \"const fs=require('fs'); fs.copyFileSync('staticwebapp.config.json','dist/staticwebapp.config.json'); fs.writeFileSync('dist/index.html','<!DOCTYPE html><html><head><meta http-equiv=\\\"refresh\\\" content=\\\"0;url=/taskpane.html\\\"></head></html>');\"",
     "validate": "office-addin-manifest validate manifest.xml"
   },
   "dependencies": {
