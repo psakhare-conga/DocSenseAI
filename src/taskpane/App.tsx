@@ -64,7 +64,7 @@ export default function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\""
+      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\"\n• \"Get PackageDocs\"\n• \"Download Doc\""
     }
   ]);
   const [input, setInput] = useState("");
@@ -229,8 +229,8 @@ export default function App() {
 
   // ── Send a chat message to the API ────────────────────────────────────────
 
-  const sendMessage = async () => {
-    const text = input.trim();
+  const sendMessage = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
 
     setInput("");
@@ -323,6 +323,10 @@ export default function App() {
   const quickAction = (prompt: string) => {
     setInput(prompt);
     inputRef.current?.focus();
+  };
+
+  const quickActionAndSend = (prompt: string) => {
+    void sendMessage(prompt);
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -445,6 +449,8 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
+        <button onClick={() => quickActionAndSend("Get Package Docs")}>Get Package Document <details></details></button>
+        <button onClick={() => quickActionAndSend("Download Doc")}>Download Document using file Id</button>
         <button onClick={() => quickAction("List all clauses in this document")}>
           List Clauses
         </button>
@@ -472,7 +478,7 @@ export default function App() {
           placeholder="Ask about this document…"
           disabled={loading}
         />
-        <button onClick={sendMessage} disabled={loading || !input.trim()}>
+        <button onClick={() => void sendMessage()} disabled={loading || !input.trim()}>
           {loading ? "…" : "Send"}
         </button>
       </div>

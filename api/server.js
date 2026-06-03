@@ -625,6 +625,21 @@ function parseActionFromReply(reply) {
   return null;
 }
 
+function extractPackageId(text = "") {
+  const input = String(text).trim();
+  if (!input) return null;
+
+  const labelled =
+    input.match(/package\s*id\s*[:=]\s*([A-Za-z0-9+/=._-]+)/i) ||
+    input.match(/packageid\s*[:=]\s*([A-Za-z0-9+/=._-]+)/i);
+  if (labelled?.[1]) return labelled[1].trim();
+
+  // Accept standalone token-like IDs (including Base64-ish values)
+  if (!/\s/.test(input) && /^[A-Za-z0-9+/=._-]{12,}$/.test(input)) return input;
+
+  return null;
+}
+
 // ── Chat Completions + Tool Calling loop ─────────────────────────────────────
 // Handles tool calls from Chat Completions API. Document tools are resolved
 // locally; MCP tools are proxied to the Foundry Toolbox endpoint.
@@ -779,6 +794,42 @@ app.post("/api/chat", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: incomingThreadId } = req.body;
   const reqId = Date.now().toString(36);
 
+  const now = Date.now();
+  const hasIncomingThread = incomingThreadId && activeThreads.has(incomingThreadId);
+  const threadId = hasIncomingThread
+    ? incomingThreadId
+    : `t-${now.toString(36)}-${Math.floor(Math.random() * 100000).toString(36)}`;
+
+  const threadState = activeThreads.get(threadId) || {
+    created: now,
+    lastUsed: now,
+    pendingIntent: null,
+  };
+  threadState.lastUsed = now;
+
+  const rawMessage = String(message || "").trim();
+  let effectiveMessage = rawMessage;
+
+  if (/^get\s*packagedocs$/i.test(rawMessage)) {
+    threadState.pendingIntent = "get_packagedocs";
+  } else if (/^download\s*doc$/i.test(rawMessage)) {
+    threadState.pendingIntent = "download_doc";
+  } else if (threadState.pendingIntent === "get_packagedocs") {
+    const packageId = extractPackageId(rawMessage);
+    if (packageId) {
+      effectiveMessage = `Get package docs for package id ${packageId}`;
+      threadState.pendingIntent = null;
+    }
+  } else if (threadState.pendingIntent === "download_doc") {
+    const packageId = extractPackageId(rawMessage);
+    if (packageId) {
+      effectiveMessage = `Download doc for package id ${packageId}`;
+      threadState.pendingIntent = null;
+    }
+  }
+
+  activeThreads.set(threadId, threadState);
+
   // Determine mode
   const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
   const mode = aiClient ? (hasTools ? "tool-calling" : "prompt-agent") : "keyword-fallback";
@@ -786,7 +837,10 @@ app.post("/api/chat", async (req, res) => {
   logger.info("CHAT_REQ", {
     message: `Chat request [${reqId}]`,
     reqId,
-    userMessage: message,
+    userMessage: effectiveMessage,
+    rawMessage,
+    threadId,
+    pendingIntent: threadState.pendingIntent,
     contentControlCount: contentControls.length,
     docTextLength: docText.length,
     mode,
@@ -802,11 +856,12 @@ app.post("/api/chat", async (req, res) => {
         reqId,
         deployment: AZURE_DEPLOYMENT,
         toolCount: DOCUMENT_TOOLS.length + mcpToolDefs.length,
-        userMessage: message
+        userMessage: effectiveMessage,
+        threadId
       });
 
       const { reply, actions, usage } = await chatWithTools(
-        systemPrompt, message, contentControls
+        systemPrompt, effectiveMessage, contentControls
       );
 
       logger.info("TOOL_CHAT_RES", {
@@ -819,7 +874,7 @@ app.post("/api/chat", async (req, res) => {
       });
 
       // Build response for client
-      const response = { reply };
+      const response = { reply, threadId };
 
       for (const action of actions) {
         if (action.type === "navigate") {
@@ -862,7 +917,7 @@ app.post("/api/chat", async (req, res) => {
         model: AZURE_DEPLOYMENT,
         messages: [
           { role: "system",  content: systemPrompt },
-          { role: "user",    content: message }
+          { role: "user",    content: effectiveMessage }
         ],
         temperature: 0.2,
         max_tokens: 800
@@ -883,7 +938,7 @@ app.post("/api/chat", async (req, res) => {
       const action      = parseActionFromReply(rawReply);
       const cleanReply  = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
 
-      const response = { reply: cleanReply };
+      const response = { reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -908,10 +963,10 @@ app.post("/api/chat", async (req, res) => {
   }
 
   // ── Keyword fallback (no AI configured or AI error) ──────────────────────
-  const msg = message.toLowerCase();
+  const msg = effectiveMessage.toLowerCase();
 
   if (msg.includes("list") || msg.includes("all clause") || msg.includes("show clause") || msg.includes("what clause")) {
-    return res.json({ reply: formatClauseList(contentControls) });
+    return res.json({ reply: formatClauseList(contentControls), threadId });
   }
 
   const findMatch =
@@ -925,22 +980,25 @@ app.post("/api/chat", async (req, res) => {
       return res.json({
         reply: `Found **${found.tag || found.title}** (ID: ${found.id}).\n\n"${(found.text || "").substring(0, 200)}…"`,
         contentControlId: found.id,
-        navigateTo: found.tag || found.title
+        navigateTo: found.tag || found.title,
+        threadId
       });
     }
-    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.` });
+    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.`, threadId });
   }
 
   const updateMatch = msg.match(/(?:change|update|replace|set)\s+(.+?)\s+(?:from\s+)?["']?(.+?)["']?\s+to\s+["']?(.+?)["']?$/);
   if (updateMatch) {
     return res.json({
       reply: `Updating "${updateMatch[2]}" → "${updateMatch[3]}". Click Apply below.`,
-      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] }
+      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] },
+      threadId
     });
   }
 
   res.json({
-    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`
+    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`,
+    threadId
   });
 });
 
