@@ -59,7 +59,7 @@ export default function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\""
+      text: "Hi! I'm Conga AI Assistance. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\""
     }
   ]);
   const [input, setInput] = useState("");
@@ -67,6 +67,7 @@ export default function App() {
   const [contentControls, setContentControls] = useState<ContentControl[]>([]);
   const [officeReady, setOfficeReady] = useState(false);
   const [showClauses, setShowClauses] = useState(false);
+  const [threadId, setThreadId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -89,6 +90,7 @@ export default function App() {
   // ── Read content controls from the open Word document ────────────────────
 
   const loadDocumentMetadata = async () => {
+    setThreadId(null); // new document load = fresh conversation session
     try {
       await Word.run(async (context) => {
         const ccs = context.document.contentControls;
@@ -241,13 +243,15 @@ export default function App() {
         body: JSON.stringify({
           message: text,
           contentControls,
-          docText: contentControls.map(cc => `${cc.tag}: ${cc.text}`).join("\n")
+          docText: contentControls.map(cc => `${cc.tag}: ${cc.text}`).join("\n"),
+          threadId
         })
       });
 
       if (!response.ok) throw new Error(`API ${response.status}`);
 
-      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction } = await response.json();
+      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; threadId?: string } = await response.json();
+      if (data.threadId) setThreadId(data.threadId);
 
       setMessages((prev) => [
         ...prev,
@@ -299,7 +303,7 @@ export default function App() {
       <div className="header">
         <div className="header-title">
           <span className="header-icon">⚡</span>
-          <span>DocSense AI</span>
+          <span>Conga AI Assistance</span>
         </div>
         <div className="header-right">
           <button

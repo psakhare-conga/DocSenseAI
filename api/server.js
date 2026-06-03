@@ -89,6 +89,30 @@ if (aiClient) {
   console.warn("Azure OpenAI not configured — using keyword fallback. Set AZURE_OPENAI_* in api/.env");
 }
 
+// ── Azure AI Agent (Assistants API) client ────────────────────────────────
+// Run `node create-agent.js` once to create the agent, then set AZURE_AGENT_ID in .env.
+// When configured, uses persistent threads for true multi-turn conversation memory.
+// Falls back to stateless chat.completions if AZURE_AGENT_ID is not set.
+const AZURE_AGENT_ID = process.env.AZURE_AGENT_ID || "";
+
+function buildAssistantsClient() {
+  if (!AZURE_API_KEY || !AZURE_AGENT_ID) return null;
+  // Prefer the Foundry project endpoint (services.ai.azure.com) so agents appear
+  // in the Foundry portal. Fall back to stripping the OpenAI endpoint if not set.
+  const foundryEndpoint = process.env.AZURE_FOUNDRY_ENDPOINT || "";
+  const baseEndpoint = foundryEndpoint
+    ? foundryEndpoint.replace(/\/+$/, "")
+    : AZURE_ENDPOINT.replace(/\/openai\/v1\/?$/, "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+  return new AzureOpenAI({ endpoint: baseEndpoint, apiKey: AZURE_API_KEY, apiVersion: "2025-01-01-preview" });
+}
+
+const assistantsClient = buildAssistantsClient();
+if (assistantsClient) {
+  console.log(`Azure AI Agent connected → agent: ${AZURE_AGENT_ID}`);
+} else {
+  console.log("Azure AI Agent not configured — set AZURE_AGENT_ID in .env to enable persistent threads");
+}
+
 const app     = express();
 const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
@@ -364,7 +388,7 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
 
   const docSnippet = docText ? docText.substring(0, 3000) : "";
 
-  return `You are DocSense AI, a contract intelligence assistant for Conga CLM contracts.
+  return `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
 ${documentProps ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}\n` : ""}
 The document currently open has the following content controls (clauses and fields):
 ${ccLines || "(none detected yet)"}
@@ -387,6 +411,41 @@ Your job:
 7. Be concise. Do not hallucinate content not present in the document.`;
 }
 
+// ── Build per-request document context (dynamic part only) ──────────────────
+// Used with the Assistants API — static behavior rules live on the agent itself.
+// Only the live document state is sent per request via `additional_instructions`.
+function buildDocumentContext(contentControls, docText, documentProps) {
+  const ccLines = contentControls.map((cc) => {
+    const type    = cc.type  || "Control";
+    const name    = cc.tag   || cc.title || "Unnamed";
+    const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
+    const flags = [
+      cc.SubType             ? `SubType:${cc.SubType}`                : null,
+      cc.SFObjectName        ? `Object:${cc.SFObjectName}`            : null,
+      cc.SFSourceAPI         ? `Field:${cc.SFSourceAPI}`              : null,
+      cc.Smart  === "true"   ? "Smart"                                : null,
+      cc.Dirty  === "true"   ? "Modified"                             : null,
+      cc.Readonly === "true" || cc.cannotEdit ? "ReadOnly"            : null,
+      cc.MarkedForDeletion === "true" ? "MarkedForDeletion"           : null,
+      cc.Action              ? `Action:${cc.Action}`                  : null,
+    ].filter(Boolean).join(", ");
+    return `- "${name}" [${type}]${flags ? ` (${flags})` : ""}: ${preview}`;
+  }).join("\n");
+
+  const docPropsSection = documentProps
+    ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k, v]) => `  ${k}: ${v}`).join("\n")}`
+    : "";
+
+  const docSnippet = docText ? docText.substring(0, 3000) : "";
+
+  return `[CURRENT DOCUMENT CONTEXT — use this to answer the user]${docPropsSection}
+Content controls (clauses and fields) in the open document:
+${ccLines || "(none detected — make sure a Conga contract document is open in Word)"}
+
+Full document text (first 3000 chars):
+${docSnippet || "(not available)"}`;
+}
+
 // ── Parse action JSON block from AI reply ─────────────────────────────────────
 
 function parseActionFromReply(reply) {
@@ -400,7 +459,8 @@ function parseActionFromReply(reply) {
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
-  const { message = "", contentControls = [], docText = "" } = req.body;
+  const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
+  let threadId = reqThreadId;
   const reqId = Date.now().toString(36); // short request ID for correlation
 
   // Log the incoming chat request
@@ -413,6 +473,90 @@ app.post("/api/chat", async (req, res) => {
     docTextLength: docText.length,
     mode: aiClient ? "azure-openai" : "keyword-fallback"
   });
+
+  // ── Agent path (Azure AI Foundry — Assistants API with persistent threads) ──
+  // Static instructions live on the agent; only live document context is sent per-run.
+  if (assistantsClient && AZURE_AGENT_ID) {
+    try {
+      // Create a new thread on first message; reuse for subsequent turns in the same session
+      if (!threadId) {
+        const thread = await assistantsClient.beta.threads.create();
+        threadId = thread.id;
+      }
+
+      // Add the user message to the thread
+      await assistantsClient.beta.threads.messages.create(threadId, {
+        role: "user",
+        content: message
+      });
+
+      // Inject live document state via additional_instructions (not stored in thread history)
+      const docContext = buildDocumentContext(contentControls, docText, null);
+
+      logger.debug("AGENT_REQ", {
+        message: `Agent run [${reqId}]`,
+        reqId, threadId,
+        agentId: AZURE_AGENT_ID,
+        docContextLength: docContext.length
+      });
+
+      const run = await assistantsClient.beta.threads.runs.createAndPoll(threadId, {
+        assistant_id: AZURE_AGENT_ID,
+        additional_instructions: docContext
+      });
+
+      if (run.status !== "completed") {
+        throw new Error(`Agent run ended with status: ${run.status}. ${run.last_error?.message || ""}`);
+      }
+
+      // Get the latest assistant message
+      const msgList  = await assistantsClient.beta.threads.messages.list(threadId, { limit: 1, order: "desc" });
+      const latestMsg = msgList.data[0];
+      const rawReply  = latestMsg?.content
+        ?.filter((c) => c.type === "text")
+        .map((c) => c.text.value)
+        .join("") || "No response from agent.";
+
+      logger.info("AGENT_RES", {
+        message: `Agent response [${reqId}]`,
+        reqId, threadId,
+        promptTokens: run.usage?.prompt_tokens,
+        completionTokens: run.usage?.completion_tokens,
+        rawReply
+      });
+
+      const action     = parseActionFromReply(rawReply);
+      const cleanReply = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
+
+      const response = { reply: cleanReply, threadId };
+
+      if (action?.action === "navigate") {
+        const found = findClause(action.tag, contentControls);
+        response.navigateTo       = action.tag;
+        response.contentControlId = found?.id;
+      }
+      if (action?.action === "update") {
+        response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+      }
+      if (action?.action === "insert") {
+        response.insertAction = { tag: action.tag, text: action.text };
+      }
+
+      logger.info("CHAT_RES", {
+        message: `Chat response [${reqId}]`,
+        reqId,
+        replyLength: cleanReply.length,
+        action: action?.action || null,
+        navigateTo: response.navigateTo || null
+      });
+
+      return res.json(response);
+
+    } catch (err) {
+      logger.error("AGENT_ERR", { message: `Agent error [${reqId}]`, reqId, threadId, error: err.message });
+      // Fall through to stateless chat.completions fallback below
+    }
+  }
 
   // ── AI path (Azure OpenAI) ──────────────────────────────────────────────
   if (aiClient) {
@@ -605,15 +749,15 @@ app.post("/api/metadata", upload.single("file"), (req, res) => {
 // ── GET /api/health ───────────────────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "DocSense AI Mock API", timestamp: new Date().toISOString() });
+  res.json({ status: "ok", service: "Conga AI Assistance API", timestamp: new Date().toISOString() });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  logger.info("STARTUP", { message: `DocSense AI API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
-  console.log(`\nDocSense AI Mock API  →  http://localhost:${PORT}`);
+  logger.info("STARTUP", { message: `Conga AI Assistance API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
+  console.log(`\nConga AI Assistance  →  http://localhost:${PORT}`);
   console.log(`Health check         →  http://localhost:${PORT}/api/health`);
   console.log(`Logs                 →  ${LOGS_DIR}\n`);
 });
