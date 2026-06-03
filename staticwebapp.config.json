@@ -8,7 +8,7 @@
   },
   "globalHeaders": {
     "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'self' https://*.officeapps.live.com https://*.microsoft.com https://www.office.com https://res.cdn.office.net",
     "Referrer-Policy": "strict-origin-when-cross-origin"
   }
 }
