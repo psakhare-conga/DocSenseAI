@@ -50,6 +50,11 @@ interface InsertAction {
   text: string;  // full text of the new clause
 }
 
+interface DeleteAction {
+  tag: string;
+  contentControlId?: number;
+}
+
 // ─── Component ──────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -67,6 +72,7 @@ export default function App() {
   const [contentControls, setContentControls] = useState<ContentControl[]>([]);
   const [officeReady, setOfficeReady] = useState(false);
   const [showClauses, setShowClauses] = useState(false);
+  const [threadId, setThreadId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -241,13 +247,19 @@ export default function App() {
         body: JSON.stringify({
           message: text,
           contentControls,
-          docText: contentControls.map(cc => `${cc.tag}: ${cc.text}`).join("\n")
+          docText: contentControls.map(cc => `${cc.tag}: ${cc.text}`).join("\n"),
+          threadId
         })
       });
 
       if (!response.ok) throw new Error(`API ${response.status}`);
 
-      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction } = await response.json();
+      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; deleteAction?: DeleteAction; threadId?: string } = await response.json();
+
+      // Persist thread ID for multi-turn conversation
+      if (data.threadId) {
+        setThreadId(data.threadId);
+      }
 
       setMessages((prev) => [
         ...prev,
@@ -269,6 +281,29 @@ export default function App() {
 
       if (data.insertAction) {
         await insertClause(data.insertAction);
+      }
+
+      if (data.deleteAction) {
+        const cc = contentControls.find(
+          (c) => c.tag === data.deleteAction!.tag ||
+                 c.tag.toLowerCase() === data.deleteAction!.tag.toLowerCase() ||
+                 c.id === data.deleteAction!.contentControlId
+        );
+        if (cc) {
+          try {
+            await Word.run(async (context) => {
+              const wordCc = context.document.contentControls.getById(cc.id);
+              wordCc.delete(false);
+              await context.sync();
+              addSystemMessage(`✅ Deleted clause "${cc.tag}".`);
+              loadDocumentMetadata();
+            });
+          } catch (err) {
+            addSystemMessage(`Failed to delete clause: ${err}`);
+          }
+        } else {
+          addSystemMessage(`Could not find clause "${data.deleteAction.tag}" to delete.`);
+        }
       }
     } catch {
       setMessages((prev) => [

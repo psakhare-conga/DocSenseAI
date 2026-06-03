@@ -89,6 +89,234 @@ if (aiClient) {
   console.warn("Azure OpenAI not configured — using keyword fallback. Set AZURE_OPENAI_* in api/.env");
 }
 
+// ── Tool-calling mode flag ─────────────────────────────────────────────────────
+// When MCP tools are discovered, we use Chat Completions with function calling
+// so the model can invoke Conga API tools + document tools in a single loop.
+const AGENT_ID = process.env.AZURE_OPENAI_AGENT_ID || "";
+if (AGENT_ID) {
+  console.log(`Agent ID configured: ${AGENT_ID} (using Chat Completions + tool calling)`);
+}
+
+// In-memory thread store: threadId → { created, lastUsed }
+const activeThreads = new Map();
+
+// ── Foundry Toolbox MCP client ─────────────────────────────────────────────
+const FOUNDRY_TOOLBOX_URL = process.env.FOUNDRY_TOOLBOX_URL || "";
+const FOUNDRY_API_KEY     = process.env.FOUNDRY_API_KEY || AZURE_API_KEY;
+
+async function callFoundryToolbox(method, params = {}) {
+  if (!FOUNDRY_TOOLBOX_URL) {
+    throw new Error("FOUNDRY_TOOLBOX_URL not configured in .env");
+  }
+
+  const body = {
+    jsonrpc: "2.0",
+    id: `req-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    method,
+    params,
+  };
+
+  const res = await fetch(FOUNDRY_TOOLBOX_URL, {
+    method: "POST",
+    headers: {
+      "api-key": FOUNDRY_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) throw new Error(`Foundry toolbox ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : { success: true };
+}
+
+if (FOUNDRY_TOOLBOX_URL) {
+  console.log(`Foundry Toolbox MCP → ${FOUNDRY_TOOLBOX_URL.split("?")[0]}...`);
+}
+
+// ── Conga token provider (auto-auth for congaapitools) ─────────────────────
+const CONGA_CLIENT_ID     = process.env.CONGA_CLIENT_ID || "";
+const CONGA_CLIENT_SECRET = process.env.CONGA_CLIENT_SECRET || "";
+const CONGA_SCOPE         = process.env.CONGA_SCOPE || "sign";
+const CONGA_AUTH_URL      = process.env.CONGA_AUTH_URL || "https://login-rlsdev.congacloud.io/api/v1/auth/connect/token";
+
+let cachedCongaToken   = "";
+let congaTokenExpiresAt = 0;
+let inflightTokenReq    = null;
+
+async function getCongaToken() {
+  if (cachedCongaToken && Date.now() < congaTokenExpiresAt - 30000) {
+    return cachedCongaToken;
+  }
+  if (inflightTokenReq) return inflightTokenReq;
+
+  inflightTokenReq = (async () => {
+    if (!CONGA_CLIENT_ID || !CONGA_CLIENT_SECRET) {
+      throw new Error("CONGA_CLIENT_ID / CONGA_CLIENT_SECRET not configured");
+    }
+    const body = new URLSearchParams({
+      client_id:     CONGA_CLIENT_ID,
+      client_secret: CONGA_CLIENT_SECRET,
+      scope:         CONGA_SCOPE,
+      grant_type:    "client_credentials",
+    });
+    const res = await fetch(CONGA_AUTH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Conga auth failed (${res.status}): ${text}`);
+    const json = JSON.parse(text);
+    cachedCongaToken    = json.access_token;
+    const expiresIn     = json.expires_in || 3600;
+    congaTokenExpiresAt = Date.now() + expiresIn * 1000;
+    logger.info("CONGA_AUTH", { message: `Token acquired, expires in ${expiresIn}s` });
+    return cachedCongaToken;
+  })().finally(() => { inflightTokenReq = null; });
+
+  return inflightTokenReq;
+}
+
+/** Inject Conga bearer token for congaapitools___ tool calls */
+async function maybeInjectAuth(toolName, args) {
+  if (!toolName.startsWith("congaapitools___")) return args;
+  if (args.Authorization && String(args.Authorization).trim()) return args;
+  try {
+    const token = await getCongaToken();
+    return { ...args, Authorization: `Bearer ${token}` };
+  } catch (err) {
+    logger.warn("TOKEN", { message: `Auth injection failed: ${err.message}` });
+    return args;
+  }
+}
+
+// Warm up Conga token on startup if credentials are set
+if (CONGA_CLIENT_ID && CONGA_CLIENT_SECRET) {
+  getCongaToken().catch(() => {});
+  console.log("Conga auth configured → tokens will be provisioned automatically");
+}
+
+// ── Tool definitions for the Hosted Agent ──────────────────────────────────
+// These are passed to createAndPoll so the agent knows it can call tools.
+
+const DOCUMENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "navigate_to_clause",
+      description: "Navigate to a specific clause or field in the document by tag name.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause or field to navigate to." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_clause",
+      description: "Update/replace text within a clause. Provide the exact text to find and its replacement.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:     { type: "string", description: "The tag name of the clause to update." },
+          find:    { type: "string", description: "The exact text to find (must not be empty)." },
+          replace: { type: "string", description: "The replacement text." },
+        },
+        required: ["tag", "find", "replace"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "insert_clause",
+      description: "Insert a brand new clause or section into the document.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:  { type: "string", description: "Name/tag for the new clause." },
+          text: { type: "string", description: "Full text content of the new clause." },
+        },
+        required: ["tag", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_clause",
+      description: "Delete a clause or content control from the document.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause to delete." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_clauses",
+      description: "List all content controls (clauses and fields) found in the document.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_clause",
+      description: "Search for a clause or field by keyword.",
+      parameters: {
+        type: "object",
+        properties: { keyword: { type: "string", description: "The keyword to search for." } },
+        required: ["keyword"],
+      },
+    },
+  },
+];
+
+// ── Dynamic MCP tool discovery ────────────────────────────────────────────
+// Fetches available tools from the Foundry Toolbox MCP endpoint on startup
+// and converts them to OpenAI function-tool format so the agent can call them.
+
+let mcpToolDefs = []; // populated by discoverMcpTools()
+
+function convertMcpToolToOpenAI(mcpTool) {
+  const schema = mcpTool.inputSchema || { type: "object", properties: {} };
+  // Remove Authorization from required since we auto-inject it server-side
+  const required = (schema.required || []).filter(r => r !== "Authorization");
+  return {
+    type: "function",
+    function: {
+      name: mcpTool.name,
+      description: mcpTool.description || `MCP tool: ${mcpTool.name}`,
+      parameters: {
+        type: "object",
+        properties: schema.properties || {},
+        ...(required.length ? { required } : {}),
+      },
+    },
+  };
+}
+
+async function discoverMcpTools() {
+  if (!FOUNDRY_TOOLBOX_URL) return;
+  try {
+    const response = await callFoundryToolbox("tools/list");
+    const tools = response?.result?.tools || [];
+    mcpToolDefs = tools.map(convertMcpToolToOpenAI);
+    console.log(`MCP tool discovery → found ${mcpToolDefs.length} tools: ${mcpToolDefs.map(t => t.function.name).join(", ")}`);
+  } catch (err) {
+    console.error(`MCP tool discovery failed: ${err.message}`);
+  }
+}
+
+// Run discovery on startup
+discoverMcpTools();
+
 const app     = express();
 const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
@@ -397,24 +625,227 @@ function parseActionFromReply(reply) {
   return null;
 }
 
+// ── Chat Completions + Tool Calling loop ─────────────────────────────────────
+// Handles tool calls from Chat Completions API. Document tools are resolved
+// locally; MCP tools are proxied to the Foundry Toolbox endpoint.
+
+async function executeToolCall(toolCall, contentControls) {
+  const name = toolCall.function.name;
+  let args;
+  try { args = JSON.parse(toolCall.function.arguments); } catch { args = {}; }
+  let action = null;
+  let result = "";
+
+  switch (name) {
+    case "navigate_to_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "navigate", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id, text: (found.text || "").substring(0, 200) });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found in the document.` });
+      }
+      break;
+    }
+    case "update_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "update", tag: args.tag, find: args.find, replace: args.replace };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "insert_clause": {
+      action = { type: "insert", tag: args.tag, text: args.text };
+      result = JSON.stringify({ success: true, tag: args.tag });
+      break;
+    }
+    case "delete_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "delete", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "list_clauses": {
+      result = formatClauseList(contentControls);
+      break;
+    }
+    case "search_clause": {
+      const found = findClause(args.keyword, contentControls);
+      if (found) {
+        result = JSON.stringify({ found: true, tag: found.tag, id: found.id, type: found.type, text: (found.text || "").substring(0, 300) });
+      } else {
+        result = JSON.stringify({ found: false, message: `No clause matching "${args.keyword}" found.` });
+      }
+      break;
+    }
+    default: {
+      // Route unknown tools through Foundry Toolbox MCP endpoint
+      if (FOUNDRY_TOOLBOX_URL) {
+        try {
+          const enrichedArgs = await maybeInjectAuth(name, args);
+          const mcpResult = await callFoundryToolbox("tools/call", {
+            name,
+            arguments: enrichedArgs,
+          });
+          logger.info("MCP_TOOL", { message: `MCP tool: ${name}`, result: JSON.stringify(mcpResult).substring(0, 500) });
+          result = JSON.stringify({ success: true, result: mcpResult });
+        } catch (err) {
+          logger.error("MCP_TOOL", { message: `MCP tool failed: ${name}`, error: err.message });
+          result = JSON.stringify({ success: false, error: err.message });
+        }
+      } else {
+        logger.warn("TOOL_CALL", { message: `Unknown tool: ${name}`, args });
+        result = JSON.stringify({ error: `Unknown tool: ${name}`, args });
+      }
+    }
+  }
+
+  return { result, action };
+}
+
+/**
+ * Run Chat Completions with a tool-call loop.
+ * The model can call document tools or MCP tools; we execute them and feed
+ * the results back until the model produces a final text response.
+ */
+async function chatWithTools(systemPrompt, userMessage, contentControls) {
+  const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user",   content: userMessage },
+  ];
+
+  const actions = [];
+  let maxIterations = 10; // safety limit
+
+  while (maxIterations-- > 0) {
+    const completion = await aiClient.chat.completions.create({
+      model: AZURE_DEPLOYMENT,
+      messages,
+      tools: allTools.length ? allTools : undefined,
+      temperature: 0.2,
+      max_tokens: 1500,
+    });
+
+    const choice = completion.choices[0];
+    const assistantMsg = choice.message;
+
+    // If no tool calls, we're done
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      return {
+        reply: assistantMsg.content || "No response.",
+        actions,
+        usage: completion.usage,
+      };
+    }
+
+    // Push assistant message (with tool_calls) to conversation
+    messages.push({
+      role: "assistant",
+      content: assistantMsg.content ?? "",
+      tool_calls: assistantMsg.tool_calls,
+    });
+
+    const toolNames = assistantMsg.tool_calls.map(tc => tc.function.name);
+    logger.info("TOOL_CALLS", { message: `Model calling tools: ${toolNames.join(", ")}` });
+
+    // Execute each tool call and push results
+    for (const tc of assistantMsg.tool_calls) {
+      const { result, action } = await executeToolCall(tc, contentControls);
+      if (action) actions.push(action);
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: result,
+      });
+      logger.debug("TOOL_RESULT", { message: `Tool ${tc.function.name}`, result: result.substring(0, 300) });
+    }
+  }
+
+  // If we exhausted iterations, return the last content
+  return { reply: "Tool call loop exceeded maximum iterations.", actions, usage: null };
+}
+
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
-  const { message = "", contentControls = [], docText = "" } = req.body;
-  const reqId = Date.now().toString(36); // short request ID for correlation
+  const { message = "", contentControls = [], docText = "", threadId: incomingThreadId } = req.body;
+  const reqId = Date.now().toString(36);
 
-  // Log the incoming chat request
+  // Determine mode
+  const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
+  const mode = aiClient ? (hasTools ? "tool-calling" : "prompt-agent") : "keyword-fallback";
+
   logger.info("CHAT_REQ", {
     message: `Chat request [${reqId}]`,
     reqId,
     userMessage: message,
     contentControlCount: contentControls.length,
-    contentControls: contentControls.map(cc => ({ id: cc.id, tag: cc.tag, type: cc.type })),
     docTextLength: docText.length,
-    mode: aiClient ? "azure-openai" : "keyword-fallback"
+    mode,
   });
 
-  // ── AI path (Azure OpenAI) ──────────────────────────────────────────────
+  // ── Chat Completions + Tool Calling ─────────────────────────────────────
+  if (aiClient && hasTools) {
+    try {
+      const systemPrompt = buildSystemPrompt(contentControls, docText, null);
+
+      logger.debug("TOOL_CHAT_REQ", {
+        message: `Tool-calling request [${reqId}]`,
+        reqId,
+        deployment: AZURE_DEPLOYMENT,
+        toolCount: DOCUMENT_TOOLS.length + mcpToolDefs.length,
+        userMessage: message
+      });
+
+      const { reply, actions, usage } = await chatWithTools(
+        systemPrompt, message, contentControls
+      );
+
+      logger.info("TOOL_CHAT_RES", {
+        message: `Tool-calling response [${reqId}]`,
+        reqId,
+        replyLength: reply.length,
+        actions: actions.map(a => a.type),
+        promptTokens: usage?.prompt_tokens,
+        completionTokens: usage?.completion_tokens,
+      });
+
+      // Build response for client
+      const response = { reply };
+
+      for (const action of actions) {
+        if (action.type === "navigate") {
+          response.navigateTo       = action.tag;
+          response.contentControlId = action.contentControlId;
+        }
+        if (action.type === "update") {
+          response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+        }
+        if (action.type === "insert") {
+          response.insertAction = { tag: action.tag, text: action.text };
+        }
+        if (action.type === "delete") {
+          response.deleteAction = { tag: action.tag, contentControlId: action.contentControlId };
+        }
+      }
+
+      return res.json(response);
+
+    } catch (err) {
+      logger.error("TOOL_CHAT_ERR", { message: `Tool-calling error [${reqId}]`, reqId, error: err.message });
+      // Fall through to simple prompt agent
+    }
+  }
+
+  // ── Prompt Agent fallback (Chat Completions API) ────────────────────────
   if (aiClient) {
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
@@ -424,7 +855,6 @@ app.post("/api/chat", async (req, res) => {
         reqId,
         deployment: AZURE_DEPLOYMENT,
         systemPromptLength: systemPrompt.length,
-        systemPrompt,
         userMessage: message
       });
 
@@ -450,7 +880,6 @@ app.post("/api/chat", async (req, res) => {
         rawReply
       });
 
-      // Strip action JSON from visible reply, parse it for navigation/update
       const action      = parseActionFromReply(rawReply);
       const cleanReply  = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
 
@@ -469,14 +898,6 @@ app.post("/api/chat", async (req, res) => {
       if (action?.action === "insert") {
         response.insertAction = { tag: action.tag, text: action.text };
       }
-
-      logger.info("CHAT_RES", {
-        message: `Chat response [${reqId}]`,
-        reqId,
-        replyLength: cleanReply.length,
-        action: action?.action || null,
-        navigateTo: response.navigateTo || null
-      });
 
       return res.json(response);
 
