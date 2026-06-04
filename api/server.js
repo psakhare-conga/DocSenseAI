@@ -97,10 +97,11 @@ const AZURE_AGENT_ID = process.env.AZURE_OPENAI_AGENT_ID || "";
 
 function buildAssistantsClient() {
   if (!AZURE_API_KEY || !AZURE_AGENT_ID) return null;
+  // Assistants API requires a dedicated Foundry project endpoint (services.ai.azure.com).
+  // The v1-compatible OpenAI endpoint does NOT support beta.threads.runs.stream.
   const foundryEndpoint = process.env.AZURE_FOUNDRY_ENDPOINT || "";
-  const baseEndpoint = foundryEndpoint
-    ? foundryEndpoint.replace(/\/+$/, "")
-    : AZURE_ENDPOINT.replace(/\/openai\/v1\/?$/, "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+  if (!foundryEndpoint) return null;
+  const baseEndpoint = foundryEndpoint.replace(/\/+$/, "");
   return new AzureOpenAI({ endpoint: baseEndpoint, apiKey: AZURE_API_KEY, apiVersion: "2025-01-01-preview" });
 }
 
@@ -894,12 +895,14 @@ async function executeToolCall(toolCall, contentControls) {
  * The model can call document tools or MCP tools; we execute them and feed
  * the results back until the model produces a final text response.
  */
-async function chatWithTools(systemPrompt, userMessage, contentControls) {
+async function chatWithTools(systemPrompt, userMessage, contentControls, history) {
   const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user",   content: userMessage },
-  ];
+  const messages = history && history.length
+    ? [{ role: "system", content: systemPrompt }, ...history]
+    : [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userMessage },
+      ];
 
   const actions = [];
   let maxIterations = 10; // safety limit
@@ -1289,8 +1292,23 @@ Return ONLY the JSON array.`;
 
 app.post("/api/chat/stream", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
-  let threadId = reqThreadId;
-  const reqId = Date.now().toString(36);
+  const now = Date.now();
+  let threadId = reqThreadId && activeThreads.has(reqThreadId)
+    ? reqThreadId
+    : `t-${now.toString(36)}-${Math.floor(Math.random() * 100000).toString(36)}`;
+
+  // Retrieve or create thread state with conversation history
+  const threadState = activeThreads.get(threadId) || { created: now, lastUsed: now, history: [] };
+  threadState.lastUsed = now;
+  // Append the new user message
+  threadState.history.push({ role: "user", content: message });
+  // Cap history to last 20 messages to prevent token overflow
+  if (threadState.history.length > 20) {
+    threadState.history = threadState.history.slice(-20);
+  }
+  activeThreads.set(threadId, threadState);
+
+  const reqId = now.toString(36);
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -1363,8 +1381,52 @@ app.post("/api/chat/stream", async (req, res) => {
     }
   }
 
-  // ── chat.completions path (streaming) ──────────────────────────────────────
+  // ── chat.completions + tool calling path ────────────────────────────────────
   if (aiClient) {
+    const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
+    const hasTools = allTools.length > 0;
+
+    // When tools are available, use the tool-calling loop (non-streaming)
+    // so MCP tools (End Review, etc.) actually execute.
+    if (hasTools) {
+      try {
+        const systemPrompt = buildSystemPrompt(contentControls, docText, null);
+        sendEvent({ type: "token", text: "" }); // signal streaming started
+
+        const { reply, actions } = await chatWithTools(
+          systemPrompt, message, contentControls, threadState.history
+        );
+
+        // Save assistant reply to thread history
+        threadState.history.push({ role: "assistant", content: reply });
+
+        const done = { type: "done", reply, threadId };
+        for (const action of actions) {
+          if (action.type === "navigate") {
+            done.navigateTo       = action.tag;
+            done.contentControlId = action.contentControlId;
+          }
+          if (action.type === "update") {
+            done.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+          }
+          if (action.type === "insert") {
+            done.insertAction = { tag: action.tag, text: action.text };
+          }
+          if (action.type === "delete") {
+            done.deleteAction = { tag: action.tag, contentControlId: action.contentControlId };
+          }
+        }
+
+        sendEvent(done);
+        endStream();
+        return;
+      } catch (err) {
+        logger.error("STREAM_TOOL_ERR", { message: `Tool-calling stream error [${reqId}]`, reqId, error: err.message });
+        // Fall through to plain streaming
+      }
+    }
+
+    // Plain streaming (no tools, or tool path failed)
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
       let fullText = "";
@@ -1373,7 +1435,7 @@ app.post("/api/chat/stream", async (req, res) => {
         model: AZURE_DEPLOYMENT,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user",   content: message }
+          ...threadState.history
         ],
         temperature: 0.2,
         max_tokens: 800,
@@ -1390,7 +1452,10 @@ app.post("/api/chat/stream", async (req, res) => {
 
       const action     = parseActionFromReply(fullText);
       const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-      const done = { type: "done", reply: cleanReply };
+
+      threadState.history.push({ role: "assistant", content: cleanReply });
+
+      const done = { type: "done", reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -1422,7 +1487,7 @@ app.post("/api/chat/stream", async (req, res) => {
   if (msg_lc.includes("list") || msg_lc.includes("all clause") || msg_lc.includes("show clause")) {
     fallbackReply = formatClauseList(contentControls);
   }
-  sendEvent({ type: "done", reply: fallbackReply });
+  sendEvent({ type: "done", reply: fallbackReply, threadId });
   endStream();
 });
 
@@ -1502,6 +1567,50 @@ app.post("/api/metadata", upload.single("file"), (req, res) => {
   } catch (err) {
     logger.error("METADATA", { message: "Failed to parse document", error: err.message });
     res.status(500).json({ error: "Failed to parse document: " + err.message });
+  }
+});
+
+// ── POST /api/end-review ──────────────────────────────────────────────────────
+// Directly calls the Conga End Review MCP tool using env-configured IDs.
+// No AI involved — just calls the tool and returns the result.
+
+app.post("/api/end-review", async (req, res) => {
+  const reviewtype = "Office365";
+  const reviewid   = process.env.CONGA_REVIEW_ID   || "";
+  const reviewerid = process.env.CONGA_REVIEWER_ID  || "";
+  const reqId = Date.now().toString(36);
+
+  if (!reviewid || !reviewerid) {
+    return res.status(400).json({ success: false, error: "CONGA_REVIEW_ID and CONGA_REVIEWER_ID must be set in api/.env" });
+  }
+
+  try {
+    // Step 1: Get ExternalToken
+    logger.info("END_REVIEW", { message: `Getting ExternalToken for reviewtype=${reviewtype}`, reqId });
+    const externalToken = await getReviewExternalToken(reviewtype);
+
+    // Step 2: Call endReviewerReview with auth + external token
+    const token = await getCongaToken();
+    const args = {
+      reviewtype,
+      reviewid,
+      reviewerid,
+      ExternalToken: externalToken || "",
+      Authorization: `Bearer ${token}`,
+    };
+
+    logger.info("END_REVIEW", { message: `Calling endReviewerReview: reviewid=${reviewid}, reviewerid=${reviewerid}`, reqId });
+    const mcpResult = await callFoundryToolbox("tools/call", {
+      name: "congaendreviewtool___endReviewerReview",
+      arguments: args,
+    });
+
+    logger.info("END_REVIEW", { message: "endReviewerReview completed", reqId, result: JSON.stringify(mcpResult).substring(0, 500) });
+    return res.json({ success: true, message: "Review ended successfully.", result: mcpResult });
+
+  } catch (err) {
+    logger.error("END_REVIEW_ERR", { message: `End review failed [${reqId}]`, reqId, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

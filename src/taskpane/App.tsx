@@ -410,6 +410,32 @@ export default function App() {
     ));
   };
 
+  // ── End Review (direct API call) ─────────────────────────────────────────
+
+  const [endReviewLoading, setEndReviewLoading] = useState(false);
+
+  const endReview = async () => {
+    if (endReviewLoading) return;
+    setEndReviewLoading(true);
+    addSystemMessage("⏳ Ending review…");
+    try {
+      const response = await fetch(`${API_URL}/api/end-review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await response.json();
+      if (data.success) {
+        addSystemMessage("✅ Review ended successfully.");
+      } else {
+        addSystemMessage(`❌ End review failed: ${data.error || "Unknown error"}`);
+      }
+    } catch (err) {
+      addSystemMessage("❌ Could not reach the API. Make sure the server is running.");
+    } finally {
+      setEndReviewLoading(false);
+    }
+  };
+
   // ── Clause risk scan ──────────────────────────────────────────────────────
 
   const scanRisk = async () => {
@@ -902,7 +928,9 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
-        <button onClick={() => quickAction("End review for reviewtype=Office365 reviewid= reviewerid=")}>End Review</button>
+        <button onClick={endReview} disabled={endReviewLoading}>
+          {endReviewLoading ? "⏳ Ending…" : "End Review"}
+        </button>
         <button
           className={`risk-scan-btn${riskLoading ? " risk-scan-btn-loading" : ""}`}
           onClick={scanRisk}
