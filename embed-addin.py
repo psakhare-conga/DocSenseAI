@@ -39,14 +39,14 @@ import re
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ADDIN_ID    = "3b9d2a8c-4f1e-4d6b-a5c3-9e2f1b4d7a8e"   # must match manifest.xml
-ADDIN_TITLE = "DocSense AI"
-ADDIN_URL   = "https://localhost:3000/taskpane.html"     # change to public URL for sharing
+ADDIN_TITLE = "Conga AI Assistance"
+ADDIN_URL   = "https://blue-mushroom-008de5a0f.7.azurestaticapps.net/taskpane.html"
 
 # developer  → sideloaded (localhost / local network)
-# Centralized → M365 Admin deployed (set STORE = "")
+# EXCatalog   → M365 Admin deployed (Centralized Deployment)
 # OMEX        → AppSource published
-STORE_TYPE  = "developer"
-STORE       = "en-US"   # set to "" for Centralized deployment
+STORE_TYPE  = "EXCatalog"
+STORE       = "EXCatalog"   # must match storeType for Centralized deployment
 # ──────────────────────────────────────────────────────────────────────────────
 
 WEBEXT_CONTENT_TYPE   = "application/vnd.ms-office.webextension+xml"
@@ -55,40 +55,25 @@ TASKPANE_CONTENT_TYPE = "application/vnd.ms-office.webextensiontaskpanes+xml"
 REL_TYPE_TASKPANES = "http://schemas.microsoft.com/office/2011/relationships/webextensiontaskpanes"
 REL_TYPE_WEBEXT    = "http://schemas.microsoft.com/office/2011/relationships/webextension"
 
-WEBEXTENSION_XML = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+def make_webextension_xml(addin_id, store, store_type, addin_title):
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <we:webextension
   xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11"
-  id="{{{ADDIN_ID}}}">
+  id="{{{addin_id}}}">
   <we:reference
-    id="{ADDIN_ID}"
+    id="{addin_id}"
     version="1.0.0.0"
-    store="{STORE}"
-    storeType="{STORE_TYPE}"/>
+    store="{store}"
+    storeType="{store_type}"/>
   <we:alternateReferences/>
   <we:properties>
-    <we:property name="addinTitle" value="{ADDIN_TITLE}"/>
+    <we:property name="addinTitle" value="{addin_title}"/>
+    <we:property name="TaskpaneId" value="DocSenseTaskPane"/>
+    <we:property name="Office.AutoShowTaskpaneWithDocument" value="true"/>
   </we:properties>
   <we:bindings/>
   <we:snapshot xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
 </we:webextension>"""
-
-TASKPANE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<wetp:taskpanes
-  xmlns:wetp="http://schemas.microsoft.com/office/webextensions/taskpanes/2010/11">
-  <wetp:taskpane dockstate="right" visibility="1" width="350" row="4">
-    <wetp:webextensionref
-      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-      r:id="rId_we1"/>
-  </wetp:taskpane>
-</wetp:taskpanes>"""
-
-TASKPANE_RELS_XML = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship
-    Id="rId_we1"
-    Type="{REL_TYPE_WEBEXT}"
-    Target="../webextensions/webextension1.xml"/>
-</Relationships>"""
 
 
 def embed_addin(input_path: str, output_path: str) -> None:
@@ -102,47 +87,88 @@ def embed_addin(input_path: str, output_path: str) -> None:
         for name in z.namelist():
             files[name] = z.read(name)
 
-    # ── 1. [Content_Types].xml ────────────────────────────────────────────────
+    # ── Discover existing webextension slots ──────────────────────────────────
+    existing_webexts = sorted(
+        n for n in files if re.match(r"word/webextensions/webextension\d+\.xml", n)
+    )
+    print(f"  Found {len(existing_webexts)} existing webextension(s): {existing_webexts}")
+
+    # Check if our add-in is already the one in slot 1 (nothing to do)
+    if existing_webexts:
+        first = files[existing_webexts[0]].decode("utf-8", errors="replace")
+        if ADDIN_ID in first:
+            print(f"  Our add-in is already embedded as {existing_webexts[0]}, nothing to do.")
+            import shutil
+            shutil.copy2(input_path, output_path)
+            print(f"\n✓  Copied unchanged → {output_path}")
+            return
+
+    # ── Strategy: replace the first (or only) webextension slot with ours ────
+    # This removes the old add-in and puts ours in its place, reusing the
+    # existing taskpanes.xml / taskpanes.xml.rels references unchanged.
+    target_slot = existing_webexts[0] if existing_webexts else "word/webextensions/webextension1.xml"
+    print(f"  Replacing {target_slot} with our add-in (removing old add-in)")
+
+    files[target_slot] = make_webextension_xml(ADDIN_ID, STORE, STORE_TYPE, ADDIN_TITLE).encode("utf-8")
+
+    # Remove any extra webextension slots (2, 3, ...) that may have been added
+    # by a previous run of this script
+    for slot in existing_webexts[1:]:
+        del files[slot]
+        print(f"  Removed extra slot: {slot}")
+
+    # ── Ensure Content_Types has the webextension entry ───────────────────────
     ct = files["[Content_Types].xml"].decode("utf-8")
-    if WEBEXT_CONTENT_TYPE not in ct:
+    slot_name = target_slot.split("/")[-1]   # e.g. webextension1.xml
+    if slot_name not in ct:
         ct = ct.replace(
             "</Types>",
-            f'  <Override PartName="/word/webextensions/webextension1.xml" ContentType="{WEBEXT_CONTENT_TYPE}"/>\n'
-            f'  <Override PartName="/word/taskpanes/taskpane1.xml" ContentType="{TASKPANE_CONTENT_TYPE}"/>\n'
-            "</Types>",
+            f'  <Override PartName="/word/webextensions/{slot_name}" ContentType="{WEBEXT_CONTENT_TYPE}"/>\n</Types>',
         )
         files["[Content_Types].xml"] = ct.encode("utf-8")
-        print("  [Content_Types].xml  → updated")
+        print(f"  [Content_Types].xml  → {slot_name} entry added")
+
+    # ── Ensure taskpanes.xml exists and shows the pane (visibility=1) ─────────
+    tp_key = "word/webextensions/taskpanes.xml"
+    rels_key = "word/webextensions/_rels/taskpanes.xml.rels"
+
+    if tp_key not in files:
+        # Build from scratch pointing to rId1 → webextension1.xml
+        files[rels_key] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{REL_TYPE_WEBEXT}" Target="{slot_name}"/>'
+            "</Relationships>"
+        ).encode("utf-8")
+        files[tp_key] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<wetp:taskpanes xmlns:wetp="http://schemas.microsoft.com/office/webextensions/taskpanes/2010/11">'
+            '<wetp:taskpane dockstate="right" visibility="1" width="350" row="4">'
+            '<wetp:webextensionref xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>'
+            "</wetp:taskpane></wetp:taskpanes>"
+        ).encode("utf-8")
+        # Content_Types for taskpanes
+        ct = files["[Content_Types].xml"].decode("utf-8")
+        if TASKPANE_CONTENT_TYPE not in ct:
+            ct = ct.replace("</Types>", f'  <Override PartName="/word/webextensions/taskpanes.xml" ContentType="{TASKPANE_CONTENT_TYPE}"/>\n</Types>')
+            files["[Content_Types].xml"] = ct.encode("utf-8")
+        # _rels/.rels
+        root_rels = files["_rels/.rels"].decode("utf-8")
+        if REL_TYPE_TASKPANES not in root_rels:
+            root_rels = root_rels.replace("</Relationships>", f'  <Relationship Id="rId_tp" Type="{REL_TYPE_TASKPANES}" Target="word/webextensions/taskpanes.xml"/>\n</Relationships>')
+            files["_rels/.rels"] = root_rels.encode("utf-8")
+        print(f"  taskpanes.xml        → created")
     else:
-        print("  [Content_Types].xml  → already contains webextension entry, skipped")
+        # Ensure visibility="1" on the first taskpane
+        tp = files[tp_key].decode("utf-8")
+        tp_fixed = re.sub(r'visibility="0"', 'visibility="1"', tp)
+        if tp_fixed != tp:
+            files[tp_key] = tp_fixed.encode("utf-8")
+            print(f"  taskpanes.xml        → visibility set to 1")
+        else:
+            print(f"  taskpanes.xml        → unchanged (visibility already 1)")
 
-    # ── 2. word/_rels/document.xml.rels ──────────────────────────────────────
-    rels_key = "word/_rels/document.xml.rels"
-    rels = files[rels_key].decode("utf-8")
-    if REL_TYPE_TASKPANES not in rels:
-        existing_nums = [int(n) for n in re.findall(r'Id="rId(\d+)"', rels)]
-        next_id = max(existing_nums, default=0) + 1
-        rels = rels.replace(
-            "</Relationships>",
-            f'  <Relationship Id="rId{next_id}" '
-            f'Type="{REL_TYPE_TASKPANES}" '
-            f'Target="../taskpanes/taskpane1.xml"/>\n'
-            "</Relationships>",
-        )
-        files[rels_key] = rels.encode("utf-8")
-        print("  document.xml.rels    → taskpanes relationship added")
-    else:
-        print("  document.xml.rels    → taskpanes relationship already present, skipped")
-
-    # ── 3. New parts ──────────────────────────────────────────────────────────
-    files["word/webextensions/webextension1.xml"]       = WEBEXTENSION_XML.encode("utf-8")
-    files["word/taskpanes/taskpane1.xml"]               = TASKPANE_XML.encode("utf-8")
-    files["word/taskpanes/_rels/taskpane1.xml.rels"]    = TASKPANE_RELS_XML.encode("utf-8")
-    print("  webextension1.xml    → written")
-    print("  taskpane1.xml        → written")
-    print("  taskpane1.xml.rels   → written")
-
-    # ── 4. Write output ───────────────────────────────────────────────────────
+    # ── Write output ──────────────────────────────────────────────────────────
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as z:
         for name, data in files.items():
             z.writestr(name, data)
@@ -154,20 +180,12 @@ def embed_addin(input_path: str, output_path: str) -> None:
     print(f"   Task pane  : {ADDIN_URL}")
     print()
 
-    if STORE_TYPE == "developer":
-        print("⚠  DEVELOPER MODE — add-in auto-loads only on machines where")
-        print("   manifest.xml has already been sideloaded via Word > Insert > Add-ins.")
-        print()
-        print("   To share with any user via Word Online:")
-        print("   1. Deploy the add-in to a public HTTPS URL")
-        print("      (free: https://vercel.com  or  Azure Static Web Apps)")
-        print("   2. Update ADDIN_URL and set STORE_TYPE = 'Centralized' in this script")
-        print("   3. M365 admin deploys manifest via admin.microsoft.com")
-        print("      Settings → Integrated Apps → Upload custom app → paste manifest URL")
-        print("   4. Re-run this script — add-in will auto-load for the whole org")
-    elif STORE_TYPE == "Centralized":
+    if STORE_TYPE == "EXCatalog":
         print("✓  CENTRALIZED DEPLOYMENT — add-in will auto-load for all users in")
         print("   the org once the admin has deployed the manifest.")
+    elif STORE_TYPE == "developer":
+        print("⚠  DEVELOPER MODE — add-in auto-loads only on machines where")
+        print("   manifest.xml has already been sideloaded via Word > Insert > Add-ins.")
 
 
 if __name__ == "__main__":
