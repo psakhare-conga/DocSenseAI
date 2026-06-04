@@ -1,5 +1,5 @@
 /**
- * One-time script: creates the DocSense AI agent in Azure OpenAI
+ * One-time script: creates the Conga AI Assistance agent in Azure OpenAI
  * and prints the AGENT_ID to add to .env
  *
  * Run: node create-agent.js
@@ -28,7 +28,7 @@ const client = new AzureOpenAI({
 // ── Static instructions stored permanently in the agent ─────────────────────
 // Everything here is NOT billed as input tokens per call.
 // Only dynamic document context (clause list) is sent per request.
-const INSTRUCTIONS = `You are DocSense AI, a contract intelligence assistant for Conga CLM contracts.
+const INSTRUCTIONS = `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
 
 BEHAVIOR RULES:
 - Answer only from the document context provided by the user in each message.
@@ -61,13 +61,13 @@ Only emit one action JSON block per reply. If the user asks for multiple changes
 handle them one at a time and confirm before proceeding to the next.`;
 
 async function main() {
-  console.log("Creating DocSense AI agent...");
+  console.log("Creating Conga AI Assistance agent...");
   console.log(`Endpoint: ${baseEndpoint}`);
 
   try {
     const agent = await client.beta.assistants.create({
       model:       "gpt-4o",
-      name:        "DocSense AI",
+      name:        "Conga AI Assistance",
       description: "Contract intelligence assistant for Conga CLM contracts",
       instructions: INSTRUCTIONS,
       temperature: 0.2,

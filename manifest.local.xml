@@ -11,7 +11,7 @@
   <Version>1.0.0.0</Version>
   <ProviderName>Conga</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
-  <DisplayName DefaultValue="DocSense AI (Local)"/>
+  <DisplayName DefaultValue="Conga AI Assistance (Local)"/>
   <Description DefaultValue="AI-powered clause intelligence for Conga contracts — LOCAL DEV"/>
   <IconUrl DefaultValue="https://localhost:3000/assets/icon-32.png"/>
   <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-80.png"/>
@@ -81,13 +81,13 @@
         <bt:Url id="LearnMoreUrl" DefaultValue="https://localhost:3000"/>
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="GetStarted.Title" DefaultValue="DocSense AI (Local) is ready!"/>
-        <bt:String id="CommandsGroup.Label" DefaultValue="DocSense AI (Local)"/>
-        <bt:String id="TaskpaneButton.Label" DefaultValue="DocSense AI (Local)"/>
+        <bt:String id="GetStarted.Title" DefaultValue="Conga AI Assistance (Local) is ready!"/>
+        <bt:String id="CommandsGroup.Label" DefaultValue="Conga AI Assistance (Local)"/>
+        <bt:String id="TaskpaneButton.Label" DefaultValue="Conga AI Assistance (Local)"/>
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="GetStarted.Description" DefaultValue="Your AI assistant for Conga contract intelligence."/>
-        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Open DocSense AI to query and navigate your contract."/>
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Open Conga AI Assistance to query and navigate your contract."/>
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>

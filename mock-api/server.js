@@ -1,5 +1,5 @@
 /**
- * DocSense AI — API Server
+ * Conga AI Assistance — API Server
  *
  * POST /api/chat        — AI chat endpoint (Azure OpenAI with keyword fallback)
  * POST /api/metadata    — parse uploaded .docx and return content controls
@@ -364,7 +364,7 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
 
   const docSnippet = docText ? docText.substring(0, 3000) : "";
 
-  return `You are DocSense AI, a contract intelligence assistant for Conga CLM contracts.
+  return `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
 ${documentProps ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}\n` : ""}
 The document currently open has the following content controls (clauses and fields):
 ${ccLines || "(none detected yet)"}
@@ -605,15 +605,15 @@ app.post("/api/metadata", upload.single("file"), (req, res) => {
 // ── GET /api/health ───────────────────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "DocSense AI Mock API", timestamp: new Date().toISOString() });
+  res.json({ status: "ok", service: "Conga AI Assistance API", timestamp: new Date().toISOString() });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  logger.info("STARTUP", { message: `DocSense AI API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
-  console.log(`\nDocSense AI Mock API  →  http://localhost:${PORT}`);
+  logger.info("STARTUP", { message: `Conga AI Assistance API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
+  console.log(`\nConga AI Assistance API  →  http://localhost:${PORT}`);
   console.log(`Health check         →  http://localhost:${PORT}/api/health`);
   console.log(`Logs                 →  ${LOGS_DIR}\n`);
 });
