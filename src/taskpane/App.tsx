@@ -427,13 +427,62 @@ export default function App() {
       if (data.success) {
         addSystemMessage("✅ Review ended successfully.");
       } else {
-        addSystemMessage(`❌ End review failed: ${data.error || "Unknown error"}`);
+        addSystemMessage(`❌ ${friendlyEndReviewError(data.error)}`);
       }
     } catch (err) {
       addSystemMessage("❌ Could not reach the API. Make sure the server is running.");
     } finally {
       setEndReviewLoading(false);
     }
+  };
+
+  /** Converts a raw MCP/API error string into a short, readable message. */
+  const friendlyEndReviewError = (raw: string | undefined): string => {
+    if (!raw) return "End review failed. Please try again.";
+
+    // The MCP tool sometimes returns a JSON string — try to parse it
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // not JSON — use as-is below
+    }
+
+    const errorType  = (parsed?.error  as string | undefined) || "";
+    const msgText    = (parsed?.message as string | undefined) || raw;
+
+    // HTTP 400 / ValidationError → review was already ended or reviewer not found
+    if (
+      errorType.toLowerCase().includes("validation") ||
+      msgText.includes("400") ||
+      msgText.toLowerCase().includes("bad request")
+    ) {
+      return "End review failed — the review may have already been ended, or the reviewer ID is no longer valid.";
+    }
+
+    // HTTP 401 / 403 → auth issue
+    if (msgText.includes("401") || msgText.includes("403") || msgText.toLowerCase().includes("unauthorized")) {
+      return "End review failed — authentication error. Your session token may have expired.";
+    }
+
+    // HTTP 404 → review/reviewer not found
+    if (msgText.includes("404") || msgText.toLowerCase().includes("not found")) {
+      return "End review failed — the review or reviewer could not be found. Check CONGA_REVIEW_ID and CONGA_REVIEWER_ID.";
+    }
+
+    // HTTP 5xx → server-side issue
+    if (msgText.includes("500") || msgText.includes("502") || msgText.includes("503")) {
+      return "End review failed — the Conga server returned an error. Please try again later.";
+    }
+
+    // Config error (missing env vars) — server sends this as a plain string
+    if (raw.includes("CONGA_REVIEW_ID") || raw.includes("CONGA_REVIEWER_ID")) {
+      return "End review failed — CONGA_REVIEW_ID or CONGA_REVIEWER_ID is not configured in the API.";
+    }
+
+    // Generic fallback: use the error type if available, otherwise a short message
+    if (errorType) return `End review failed — ${errorType}.`;
+    return "End review failed. Please try again or contact support.";
   };
 
   // ── Clause risk scan ──────────────────────────────────────────────────────
@@ -663,6 +712,30 @@ export default function App() {
     setInput(prompt);
     inputRef.current?.focus();
   };
+
+  // ── Dynamic clause buttons — derived from loaded document content controls ─
+  // Only shows clauses actually present in the document. No static fallbacks.
+  const clauseQuickActions = React.useMemo(() => {
+    const seen = new Set<string>();
+    return contentControls
+      .filter((cc) => (cc.type || "").toLowerCase() === "clause")
+      .map((cc) => {
+        const isNumericTag = /^\d+$/.test(cc.tag || "");
+        return (
+          cc.clauseName ||
+          (cc.placeholderText?.trim() || null) ||
+          (!isNumericTag ? cc.tag || null : null) ||
+          (cc.text ? cc.text.trim().split(/\s+/).slice(0, 4).join(" ") + "…" : null)
+        );
+      })
+      .filter((name): name is string => !!name && name.length > 0)
+      .filter((name) => {
+        if (seen.has(name)) return false;
+        seen.add(name);
+        return true;
+      })
+      .slice(0, 8); // cap at 8 to avoid overflowing the bar
+  }, [contentControls]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -942,18 +1015,14 @@ export default function App() {
         <button onClick={() => quickAction("List all clauses in this document")}>
           List Clauses
         </button>
-        <button onClick={() => quickAction("Find the payment clause")}>
-          Payment
+        <button onClick={() => quickAction("List all fields in this document")}>
+          List Fields
         </button>
-        <button onClick={() => quickAction("Find the termination clause")}>
-          Termination
-        </button>
-        <button onClick={() => quickAction("Summarize the obligations")}>
-          Obligations
-        </button>
-        <button onClick={() => quickAction("Find the confidentiality clause")}>
-          Confidentiality
-        </button>
+        {clauseQuickActions.map((name) => (
+          <button key={name} onClick={() => quickAction(`Find the ${name} clause`)}>
+            {name}
+          </button>
+        ))}
       </div>
 
       {/* ── Input ── */}
