@@ -6,23 +6,24 @@
   xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
   xsi:type="TaskPaneApp">
 
-  <Id>3b9d2a8c-4f1e-4d6b-a5c3-9e2f1b4d7a8e</Id>
+  <!-- Different Id from production so both can be sideloaded simultaneously -->
+  <Id>3b9d2a8c-4f1e-4d6b-a5c3-9e2f1b4d7a8f</Id>
   <Version>1.0.0.0</Version>
   <ProviderName>Conga</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
-  <DisplayName DefaultValue="DocSense AI"/>
-  <Description DefaultValue="AI-powered clause intelligence for Conga contracts"/>
-  <IconUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-32.png"/>
-  <HighResolutionIconUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-80.png"/>
-  <SupportUrl DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net"/>
+  <DisplayName DefaultValue="DocSense AI (Local)"/>
+  <Description DefaultValue="AI-powered clause intelligence for Conga contracts — LOCAL DEV"/>
+  <IconUrl DefaultValue="https://localhost:3000/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-80.png"/>
+  <SupportUrl DefaultValue="https://localhost:3000"/>
   <AppDomains>
-    <AppDomain>https://blue-mushroom-008de5a0f.7.azurestaticapps.net</AppDomain>
+    <AppDomain>https://localhost:3000</AppDomain>
   </AppDomains>
   <Hosts>
     <Host Name="Document"/>
   </Hosts>
   <DefaultSettings>
-    <SourceLocation DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/taskpane.html"/>
+    <SourceLocation DefaultValue="https://localhost:3000/taskpane.html"/>
   </DefaultSettings>
   <Permissions>ReadWriteDocument</Permissions>
 
@@ -69,20 +70,20 @@
     </Hosts>
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-16.png"/>
-        <bt:Image id="Icon.32x32" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-32.png"/>
-        <bt:Image id="Icon.80x80" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/assets/icon-80.png"/>
+        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:3000/assets/icon-16.png"/>
+        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:3000/assets/icon-32.png"/>
+        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:3000/assets/icon-80.png"/>
       </bt:Images>
       <bt:Urls>
         <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://go.microsoft.com/fwlink/?LinkId=276812"/>
-        <bt:Url id="Commands.Url" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/commands.html"/>
-        <bt:Url id="Taskpane.Url" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net/taskpane.html"/>
-        <bt:Url id="LearnMoreUrl" DefaultValue="https://blue-mushroom-008de5a0f.7.azurestaticapps.net"/>
+        <bt:Url id="Commands.Url" DefaultValue="https://localhost:3000/commands.html"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3000/taskpane.html"/>
+        <bt:Url id="LearnMoreUrl" DefaultValue="https://localhost:3000"/>
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="GetStarted.Title" DefaultValue="DocSense AI is ready!"/>
-        <bt:String id="CommandsGroup.Label" DefaultValue="DocSense AI"/>
-        <bt:String id="TaskpaneButton.Label" DefaultValue="DocSense AI"/>
+        <bt:String id="GetStarted.Title" DefaultValue="DocSense AI (Local) is ready!"/>
+        <bt:String id="CommandsGroup.Label" DefaultValue="DocSense AI (Local)"/>
+        <bt:String id="TaskpaneButton.Label" DefaultValue="DocSense AI (Local)"/>
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="GetStarted.Description" DefaultValue="Your AI assistant for Conga contract intelligence."/>

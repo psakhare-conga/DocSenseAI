@@ -6,10 +6,6 @@ dist/
 
 # Environment secrets — NEVER commit these
 api/.env
-mock-api/.env
-
-# Local development manifest (points to localhost)
-manifest.local.xml
 
 # Logs
 logs/

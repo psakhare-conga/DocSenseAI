@@ -89,29 +89,317 @@ if (aiClient) {
   console.warn("Azure OpenAI not configured — using keyword fallback. Set AZURE_OPENAI_* in api/.env");
 }
 
-// ── Azure AI Agent (Assistants API) client ────────────────────────────────
-// Run `node create-agent.js` once to create the agent, then set AZURE_AGENT_ID in .env.
-// When configured, uses persistent threads for true multi-turn conversation memory.
-// Falls back to stateless chat.completions if AZURE_AGENT_ID is not set.
-const AZURE_AGENT_ID = process.env.AZURE_AGENT_ID || "";
-
-function buildAssistantsClient() {
-  if (!AZURE_API_KEY || !AZURE_AGENT_ID) return null;
-  // Prefer the Foundry project endpoint (services.ai.azure.com) so agents appear
-  // in the Foundry portal. Fall back to stripping the OpenAI endpoint if not set.
-  const foundryEndpoint = process.env.AZURE_FOUNDRY_ENDPOINT || "";
-  const baseEndpoint = foundryEndpoint
-    ? foundryEndpoint.replace(/\/+$/, "")
-    : AZURE_ENDPOINT.replace(/\/openai\/v1\/?$/, "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
-  return new AzureOpenAI({ endpoint: baseEndpoint, apiKey: AZURE_API_KEY, apiVersion: "2025-01-01-preview" });
+// ── Tool-calling mode flag ─────────────────────────────────────────────────────
+// When MCP tools are discovered, we use Chat Completions with function calling
+// so the model can invoke Conga API tools + document tools in a single loop.
+const AGENT_ID = process.env.AZURE_OPENAI_AGENT_ID || "";
+if (AGENT_ID) {
+  console.log(`Agent ID configured: ${AGENT_ID} (using Chat Completions + tool calling)`);
 }
 
-const assistantsClient = buildAssistantsClient();
-if (assistantsClient) {
-  console.log(`Azure AI Agent connected → agent: ${AZURE_AGENT_ID}`);
-} else {
-  console.log("Azure AI Agent not configured — set AZURE_AGENT_ID in .env to enable persistent threads");
+// In-memory thread store: threadId → { created, lastUsed }
+const activeThreads = new Map();
+
+// ── Foundry Toolbox MCP client ─────────────────────────────────────────────
+const FOUNDRY_TOOLBOX_URL = process.env.FOUNDRY_TOOLBOX_URL || "";
+const FOUNDRY_API_KEY     = process.env.FOUNDRY_API_KEY || AZURE_API_KEY;
+
+async function callFoundryToolbox(method, params = {}) {
+  if (!FOUNDRY_TOOLBOX_URL) {
+    throw new Error("FOUNDRY_TOOLBOX_URL not configured in .env");
+  }
+
+  const body = {
+    jsonrpc: "2.0",
+    id: `req-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    method,
+    params,
+  };
+
+  const res = await fetch(FOUNDRY_TOOLBOX_URL, {
+    method: "POST",
+    headers: {
+      "api-key": FOUNDRY_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) throw new Error(`Foundry toolbox ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : { success: true };
 }
+
+if (FOUNDRY_TOOLBOX_URL) {
+  console.log(`Foundry Toolbox MCP → ${FOUNDRY_TOOLBOX_URL.split("?")[0]}...`);
+}
+
+// ── Conga token provider (auto-auth for review tools) ─────────────────────
+const CONGA_CLIENT_ID     = process.env.CONGA_CLIENT_ID || "";
+const CONGA_CLIENT_SECRET = process.env.CONGA_CLIENT_SECRET || "";
+const CONGA_SCOPE         = process.env.CONGA_SCOPE || "sign";
+const CONGA_AUTH_URL      = process.env.CONGA_AUTH_URL || "https://login-rlsdev.congacloud.io/api/v1/auth/connect/token";
+
+let cachedCongaToken   = "";
+let congaTokenExpiresAt = 0;
+let inflightTokenReq    = null;
+
+async function getCongaToken() {
+  if (cachedCongaToken && Date.now() < congaTokenExpiresAt - 30000) {
+    return cachedCongaToken;
+  }
+  if (inflightTokenReq) return inflightTokenReq;
+
+  inflightTokenReq = (async () => {
+    if (!CONGA_CLIENT_ID || !CONGA_CLIENT_SECRET) {
+      throw new Error("CONGA_CLIENT_ID / CONGA_CLIENT_SECRET not configured");
+    }
+    const body = new URLSearchParams({
+      client_id:     CONGA_CLIENT_ID,
+      client_secret: CONGA_CLIENT_SECRET,
+      scope:         CONGA_SCOPE,
+      grant_type:    "client_credentials",
+    });
+    const res = await fetch(CONGA_AUTH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Conga auth failed (${res.status}): ${text}`);
+    const json = JSON.parse(text);
+    cachedCongaToken    = json.access_token;
+    const expiresIn     = json.expires_in || 3600;
+    congaTokenExpiresAt = Date.now() + expiresIn * 1000;
+    logger.info("CONGA_AUTH", { message: `Token acquired, expires in ${expiresIn}s` });
+    return cachedCongaToken;
+  })().finally(() => { inflightTokenReq = null; });
+
+  return inflightTokenReq;
+}
+
+/** Inject Conga bearer token for congaendreviewtool___ tool calls */
+async function maybeInjectAuth(toolName, args) {
+  const needsAuth = toolName.startsWith("congaendreviewtool___");
+  if (!needsAuth) return args;
+  if (args.Authorization && String(args.Authorization).trim()) return args;
+  try {
+    const token = await getCongaToken();
+    return { ...args, Authorization: `Bearer ${token}` };
+  } catch (err) {
+    logger.warn("TOKEN", { message: `Auth injection failed: ${err.message}` });
+    return args;
+  }
+}
+
+/**
+ * Call getReviewAuthorization via MCP to obtain the ExternalToken needed
+ * by the endReviewerReview endpoint (Office365 flow).
+ */
+async function getReviewExternalToken(reviewtype) {
+  const token = await getCongaToken();
+  const authResult = await callFoundryToolbox("tools/call", {
+    name: "congaendreviewtool___getReviewAuthorization",
+    arguments: {
+      reviewtype: reviewtype || "Office365",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  // Extract external token from MCP response
+  let externalToken = "";
+  try {
+    const payload = authResult?.result;
+
+    // Log the content parts specifically (not the huge _meta block)
+    if (payload?.content) {
+      const contentTexts = payload.content.map(c => c.text || "").join("");
+      logger.info("REVIEW_AUTH", { message: "Response content", content: contentTexts.substring(0, 2000) });
+    } else {
+      logger.info("REVIEW_AUTH", { message: "Full response (no content array)", result: JSON.stringify(authResult).substring(0, 2000) });
+    }
+
+    if (payload?.content) {
+      // MCP content array format: [{ type: "text", text: "..." }]
+      const textContent = payload.content.find(c => c.type === "text");
+      if (textContent && textContent.text) {
+        const raw = textContent.text.trim();
+        // Try parsing as JSON
+        try {
+          const parsed = JSON.parse(raw);
+          // Conga Review API returns: { Value: { Token: { AuthToken: "..." } } }
+          externalToken = parsed?.Value?.Token?.AuthToken
+            || parsed?.value?.token?.authToken
+            || parsed.externalToken || parsed.ExternalToken
+            || parsed.token || parsed.Token
+            || parsed.access_token || parsed.accessToken
+            || parsed.authUrl || parsed.authURL || parsed.auth_url
+            || "";
+          // If parsed is a plain string, use it directly
+          if (!externalToken && typeof parsed === "string") externalToken = parsed;
+          // If parsed has a nested data/value object
+          if (!externalToken && parsed.data) {
+            externalToken = parsed.data.externalToken || parsed.data.token || parsed.data.access_token || "";
+          }
+          // If parsed has a redirectUrl with token in query params
+          if (!externalToken && (parsed.redirectUrl || parsed.url)) {
+            const url = parsed.redirectUrl || parsed.url;
+            const match = url.match(/[?&](?:token|code|access_token)=([^&]+)/i);
+            if (match) externalToken = decodeURIComponent(match[1]);
+            else externalToken = url; // pass the whole URL as external token
+          }
+        } catch {
+          // Not JSON — use the raw text as the token
+          externalToken = raw;
+        }
+      }
+    } else if (typeof payload === "string") {
+      externalToken = payload;
+    }
+  } catch (err) {
+    logger.warn("REVIEW_AUTH", { message: `Could not parse external token: ${err.message}` });
+  }
+
+  if (externalToken) {
+    logger.info("REVIEW_AUTH", { message: `ExternalToken obtained (${externalToken.length} chars)` });
+  } else {
+    logger.warn("REVIEW_AUTH", { message: "ExternalToken could not be extracted from response" });
+  }
+  return externalToken;
+}
+
+// Warm up Conga token on startup if credentials are set
+if (CONGA_CLIENT_ID && CONGA_CLIENT_SECRET) {
+  getCongaToken().catch(() => {});
+  console.log("Conga auth configured → tokens will be provisioned automatically");
+}
+
+// ── Tool definitions for the Hosted Agent ──────────────────────────────────
+// These are passed to createAndPoll so the agent knows it can call tools.
+
+const DOCUMENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "navigate_to_clause",
+      description: "Navigate to a specific clause or field in the document by tag name.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause or field to navigate to." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_clause",
+      description: "Update/replace text within a clause. Provide the exact text to find and its replacement.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:     { type: "string", description: "The tag name of the clause to update." },
+          find:    { type: "string", description: "The exact text to find (must not be empty)." },
+          replace: { type: "string", description: "The replacement text." },
+        },
+        required: ["tag", "find", "replace"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "insert_clause",
+      description: "Insert a brand new clause or section into the document.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:  { type: "string", description: "Name/tag for the new clause." },
+          text: { type: "string", description: "Full text content of the new clause." },
+        },
+        required: ["tag", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_clause",
+      description: "Delete a clause or content control from the document.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause to delete." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_clauses",
+      description: "List all content controls (clauses and fields) found in the document.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_clause",
+      description: "Search for a clause or field by keyword.",
+      parameters: {
+        type: "object",
+        properties: { keyword: { type: "string", description: "The keyword to search for." } },
+        required: ["keyword"],
+      },
+    },
+  },
+];
+
+// ── Dynamic MCP tool discovery ────────────────────────────────────────────
+// Fetches available tools from the Foundry Toolbox MCP endpoint on startup
+// and converts them to OpenAI function-tool format so the agent can call them.
+
+let mcpToolDefs = []; // populated by discoverMcpTools()
+
+function convertMcpToolToOpenAI(mcpTool) {
+  const schema = mcpTool.inputSchema || { type: "object", properties: {} };
+  // Remove auth-related params since we auto-inject them server-side
+  const AUTO_INJECTED = new Set(["Authorization", "ExternalToken"]);
+  const required = (schema.required || []).filter(r => !AUTO_INJECTED.has(r));
+  // Also strip them from properties so the model never tries to supply them
+  const properties = { ...(schema.properties || {}) };
+  for (const key of AUTO_INJECTED) delete properties[key];
+  return {
+    type: "function",
+    function: {
+      name: mcpTool.name,
+      description: mcpTool.description || `MCP tool: ${mcpTool.name}`,
+      parameters: {
+        type: "object",
+        properties,
+        ...(required.length ? { required } : {}),
+      },
+    },
+  };
+}
+
+async function discoverMcpTools() {
+  if (!FOUNDRY_TOOLBOX_URL) return;
+  try {
+    const response = await callFoundryToolbox("tools/list");
+    const tools = response?.result?.tools || [];
+    // Only keep review tools (congaendreviewtool___*); skip congaapitools___ and congaauth___
+    const KEEP_PREFIXES = ["congaendreviewtool___"];
+    const filtered = tools.filter(t => KEEP_PREFIXES.some(p => t.name.startsWith(p)));
+    mcpToolDefs = filtered.map(convertMcpToolToOpenAI);
+    console.log(`MCP tool discovery → found ${tools.length} tools, kept ${mcpToolDefs.length}: ${mcpToolDefs.map(t => t.function.name).join(", ")}`);
+  } catch (err) {
+    console.error(`MCP tool discovery failed: ${err.message}`);
+  }
+}
+
+// Run discovery on startup
+discoverMcpTools();
 
 const app     = express();
 const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -364,7 +652,7 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
     const name    = cc.tag   || cc.title || "Unnamed";
-    const preview = cc.text  || "(no text)";
+    const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
 
     // Surface key metadata flags so the AI understands the contract state
     const flags = [
@@ -386,14 +674,14 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
     ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}`
     : "";
 
-  const docSnippet = docText || "";
+  const docSnippet = docText ? docText.substring(0, 3000) : "";
 
-  return `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
+  return `You are DocSense AI, a contract intelligence assistant for Conga CLM contracts.
 ${documentProps ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}\n` : ""}
 The document currently open has the following content controls (clauses and fields):
 ${ccLines || "(none detected yet)"}
 
-Full document text:
+Full document text (first 3000 chars):
 ${docSnippet || "(not available)"}
 
 Your job:
@@ -408,37 +696,14 @@ Your job:
 5. If the user asks to insert or add a BRAND NEW clause or section to the document, include:
    {"action":"insert","tag":"<new clause name>","text":"<full text of the new clause>"}
 6. If the user asks to list clauses or fields, list them clearly.
-7. Be concise. Do not hallucinate content not present in the document.`;
-}
+7. Be concise. Do not hallucinate content not present in the document.
 
-// ── Build per-request document context (dynamic part only) ──────────────────
-// Used with the Assistants API — static behavior rules live on the agent itself.
-// Only the live document state is sent per request via `additional_instructions`.
-function buildDocumentContext(contentControls, docText, documentProps) {
-  const ccLines = contentControls.map((cc) => {
-    const type    = cc.type  || "Control";
-    const name    = cc.tag   || cc.title || "Unnamed";
-    const text    = cc.text  || "(no text)";
-    const flags = [
-      cc.SubType             ? `SubType:${cc.SubType}`                : null,
-      cc.SFObjectName        ? `Object:${cc.SFObjectName}`            : null,
-      cc.SFSourceAPI         ? `Field:${cc.SFSourceAPI}`              : null,
-      cc.Smart  === "true"   ? "Smart"                                : null,
-      cc.Dirty  === "true"   ? "Modified"                             : null,
-      cc.Readonly === "true" || cc.cannotEdit ? "ReadOnly"            : null,
-      cc.MarkedForDeletion === "true" ? "MarkedForDeletion"           : null,
-      cc.Action              ? `Action:${cc.Action}`                  : null,
-    ].filter(Boolean).join(", ");
-    return `- "${name}" [${type}]${flags ? ` (${flags})` : ""}: ${text}`;
-  }).join("\n");
-
-  const docPropsSection = documentProps
-    ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k, v]) => `  ${k}: ${v}`).join("\n")}`
-    : "";
-
-  return `[CURRENT DOCUMENT CONTEXT — use this to answer the user]${docPropsSection}
-Content controls (clauses and fields) in the open document:
-${ccLines || "(none detected — make sure a Conga contract document is open in Word)"}`;
+IMPORTANT — Conga API tools:
+• Authentication (Authorization header, ExternalToken) is handled AUTOMATICALLY by the server. NEVER ask the user for tokens, credentials, client_id, client_secret, or any auth details.
+• For congaendreviewtool___endReviewerReview: just call it with reviewtype, reviewid, and reviewerid. The server will automatically fetch the ExternalToken (via getReviewAuthorization) and inject the Authorization header. NEVER ask the user for ExternalToken or Authorization.
+• For congaendreviewtool___getReviewAuthorization: just call it with reviewtype. Authorization is injected automatically.
+• NEVER call congaauth___createBearerToken manually — the app handles authentication behind the scenes.
+• Only ask the user for BUSINESS parameters (reviewid, reviewerid, reviewtype, etc.).`;
 }
 
 // ── Parse action JSON block from AI reply ─────────────────────────────────────
@@ -451,109 +716,284 @@ function parseActionFromReply(reply) {
   return null;
 }
 
+// ── Chat Completions + Tool Calling loop ─────────────────────────────────────
+// Handles tool calls from Chat Completions API. Document tools are resolved
+// locally; MCP tools are proxied to the Foundry Toolbox endpoint.
+
+async function executeToolCall(toolCall, contentControls) {
+  const name = toolCall.function.name;
+  let args;
+  try { args = JSON.parse(toolCall.function.arguments); } catch { args = {}; }
+  let action = null;
+  let result = "";
+
+  switch (name) {
+    case "navigate_to_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "navigate", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id, text: (found.text || "").substring(0, 200) });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found in the document.` });
+      }
+      break;
+    }
+    case "update_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "update", tag: args.tag, find: args.find, replace: args.replace };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "insert_clause": {
+      action = { type: "insert", tag: args.tag, text: args.text };
+      result = JSON.stringify({ success: true, tag: args.tag });
+      break;
+    }
+    case "delete_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "delete", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "list_clauses": {
+      result = formatClauseList(contentControls);
+      break;
+    }
+    case "search_clause": {
+      const found = findClause(args.keyword, contentControls);
+      if (found) {
+        result = JSON.stringify({ found: true, tag: found.tag, id: found.id, type: found.type, text: (found.text || "").substring(0, 300) });
+      } else {
+        result = JSON.stringify({ found: false, message: `No clause matching "${args.keyword}" found.` });
+      }
+      break;
+    }
+    case "congaendreviewtool___endReviewerReview": {
+      // Orchestrated flow: get ExternalToken via authorize, then call end review
+      const reviewtype = args.reviewtype || "Office365";
+      const reviewid = args.reviewid || "";
+      const reviewerid = args.reviewerid || "";
+      if (!reviewid || !reviewerid) {
+        result = JSON.stringify({ success: false, error: "reviewid and reviewerid are required" });
+        break;
+      }
+      try {
+        // Step 1: Get ExternalToken via getReviewAuthorization
+        let externalToken = args.ExternalToken || "";
+        if (!externalToken) {
+          logger.info("REVIEW_FLOW", { message: `Fetching ExternalToken for reviewtype=${reviewtype}` });
+          externalToken = await getReviewExternalToken(reviewtype);
+          if (!externalToken) {
+            logger.warn("REVIEW_FLOW", { message: "ExternalToken could not be obtained from authorize endpoint" });
+          }
+        }
+        // Step 2: Call endReviewerReview with all params + ExternalToken
+        const enrichedArgs = await maybeInjectAuth(name, {
+          ...args,
+          reviewtype,
+          reviewid,
+          reviewerid,
+          ExternalToken: externalToken,
+        });
+        logger.info("REVIEW_FLOW", { message: `Calling endReviewerReview: reviewid=${reviewid}, reviewerid=${reviewerid}` });
+        const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
+        logger.info("REVIEW_FLOW", { message: "endReviewerReview completed", result: JSON.stringify(mcpResult).substring(0, 500) });
+        result = JSON.stringify({ success: true, result: mcpResult });
+      } catch (err) {
+        logger.error("REVIEW_FLOW", { message: `endReviewerReview failed: ${err.message}` });
+        result = JSON.stringify({ success: false, error: err.message });
+      }
+      break;
+    }
+    default: {
+      // Route unknown tools through Foundry Toolbox MCP endpoint
+      if (FOUNDRY_TOOLBOX_URL) {
+        try {
+          const enrichedArgs = await maybeInjectAuth(name, args);
+          const mcpResult = await callFoundryToolbox("tools/call", {
+            name,
+            arguments: enrichedArgs,
+          });
+          logger.info("MCP_TOOL", { message: `MCP tool: ${name}`, result: JSON.stringify(mcpResult).substring(0, 500) });
+          result = JSON.stringify({ success: true, result: mcpResult });
+        } catch (err) {
+          logger.error("MCP_TOOL", { message: `MCP tool failed: ${name}`, error: err.message });
+          result = JSON.stringify({ success: false, error: err.message });
+        }
+      } else {
+        logger.warn("TOOL_CALL", { message: `Unknown tool: ${name}`, args });
+        result = JSON.stringify({ error: `Unknown tool: ${name}`, args });
+      }
+    }
+  }
+
+  return { result, action };
+}
+
+/**
+ * Run Chat Completions with a tool-call loop.
+ * The model can call document tools or MCP tools; we execute them and feed
+ * the results back until the model produces a final text response.
+ */
+async function chatWithTools(systemPrompt, userMessage, contentControls) {
+  const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user",   content: userMessage },
+  ];
+
+  const actions = [];
+  let maxIterations = 10; // safety limit
+
+  while (maxIterations-- > 0) {
+    const completion = await aiClient.chat.completions.create({
+      model: AZURE_DEPLOYMENT,
+      messages,
+      tools: allTools.length ? allTools : undefined,
+      temperature: 0.2,
+      max_tokens: 1500,
+    });
+
+    const choice = completion.choices[0];
+    const assistantMsg = choice.message;
+
+    // If no tool calls, we're done
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      return {
+        reply: assistantMsg.content || "No response.",
+        actions,
+        usage: completion.usage,
+      };
+    }
+
+    // Push assistant message (with tool_calls) to conversation
+    messages.push({
+      role: "assistant",
+      content: assistantMsg.content ?? "",
+      tool_calls: assistantMsg.tool_calls,
+    });
+
+    const toolNames = assistantMsg.tool_calls.map(tc => tc.function.name);
+    logger.info("TOOL_CALLS", { message: `Model calling tools: ${toolNames.join(", ")}` });
+
+    // Execute each tool call and push results
+    for (const tc of assistantMsg.tool_calls) {
+      const { result, action } = await executeToolCall(tc, contentControls);
+      if (action) actions.push(action);
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: result,
+      });
+      logger.debug("TOOL_RESULT", { message: `Tool ${tc.function.name}`, result: result.substring(0, 300) });
+    }
+  }
+
+  // If we exhausted iterations, return the last content
+  return { reply: "Tool call loop exceeded maximum iterations.", actions, usage: null };
+}
+
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
-  const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
-  let threadId = reqThreadId;
-  const reqId = Date.now().toString(36); // short request ID for correlation
+  const { message = "", contentControls = [], docText = "", threadId: incomingThreadId } = req.body;
+  const reqId = Date.now().toString(36);
 
-  // Log the incoming chat request
+  const now = Date.now();
+  const hasIncomingThread = incomingThreadId && activeThreads.has(incomingThreadId);
+  const threadId = hasIncomingThread
+    ? incomingThreadId
+    : `t-${now.toString(36)}-${Math.floor(Math.random() * 100000).toString(36)}`;
+
+  const threadState = activeThreads.get(threadId) || {
+    created: now,
+    lastUsed: now,
+  };
+  threadState.lastUsed = now;
+
+  const rawMessage = String(message || "").trim();
+  const effectiveMessage = rawMessage;
+
+  activeThreads.set(threadId, threadState);
+
+  // Determine mode
+  const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
+  const mode = aiClient ? (hasTools ? "tool-calling" : "prompt-agent") : "keyword-fallback";
+
   logger.info("CHAT_REQ", {
     message: `Chat request [${reqId}]`,
     reqId,
-    userMessage: message,
+    userMessage: effectiveMessage,
+    rawMessage,
+    threadId,
     contentControlCount: contentControls.length,
-    contentControls: contentControls.map(cc => ({ id: cc.id, tag: cc.tag, type: cc.type })),
     docTextLength: docText.length,
-    mode: aiClient ? "azure-openai" : "keyword-fallback"
+    mode,
   });
 
-  // ── Agent path (Azure AI Foundry — Assistants API with persistent threads) ──
-  // Static instructions live on the agent; only live document context is sent per-run.
-  if (assistantsClient && AZURE_AGENT_ID) {
+  // ── Chat Completions + Tool Calling ─────────────────────────────────────
+  if (aiClient && hasTools) {
     try {
-      // Create a new thread on first message; reuse for subsequent turns in the same session
-      if (!threadId) {
-        const thread = await assistantsClient.beta.threads.create();
-        threadId = thread.id;
-      }
+      const systemPrompt = buildSystemPrompt(contentControls, docText, null);
 
-      // Add the user message to the thread
-      await assistantsClient.beta.threads.messages.create(threadId, {
-        role: "user",
-        content: message
-      });
-
-      // Inject live document state via additional_instructions (not stored in thread history)
-      const docContext = buildDocumentContext(contentControls, docText, null);
-
-      logger.debug("AGENT_REQ", {
-        message: `Agent run [${reqId}]`,
-        reqId, threadId,
-        agentId: AZURE_AGENT_ID,
-        docContextLength: docContext.length
-      });
-
-      const run = await assistantsClient.beta.threads.runs.createAndPoll(threadId, {
-        assistant_id: AZURE_AGENT_ID,
-        additional_instructions: docContext
-      });
-
-      if (run.status !== "completed") {
-        throw new Error(`Agent run ended with status: ${run.status}. ${run.last_error?.message || ""}`);
-      }
-
-      // Get the latest assistant message
-      const msgList  = await assistantsClient.beta.threads.messages.list(threadId, { limit: 1, order: "desc" });
-      const latestMsg = msgList.data[0];
-      const rawReply  = latestMsg?.content
-        ?.filter((c) => c.type === "text")
-        .map((c) => c.text.value)
-        .join("") || "No response from agent.";
-
-      logger.info("AGENT_RES", {
-        message: `Agent response [${reqId}]`,
-        reqId, threadId,
-        promptTokens: run.usage?.prompt_tokens,
-        completionTokens: run.usage?.completion_tokens,
-        rawReply
-      });
-
-      const action     = parseActionFromReply(rawReply);
-      const cleanReply = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-
-      const response = { reply: cleanReply, threadId };
-
-      if (action?.action === "navigate") {
-        const found = findClause(action.tag, contentControls);
-        response.navigateTo       = action.tag;
-        response.contentControlId = found?.id;
-      }
-      if (action?.action === "update") {
-        response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
-      }
-      if (action?.action === "insert") {
-        response.insertAction = { tag: action.tag, text: action.text };
-      }
-
-      logger.info("CHAT_RES", {
-        message: `Chat response [${reqId}]`,
+      logger.debug("TOOL_CHAT_REQ", {
+        message: `Tool-calling request [${reqId}]`,
         reqId,
-        replyLength: cleanReply.length,
-        action: action?.action || null,
-        navigateTo: response.navigateTo || null
+        deployment: AZURE_DEPLOYMENT,
+        toolCount: DOCUMENT_TOOLS.length + mcpToolDefs.length,
+        userMessage: effectiveMessage,
+        threadId
       });
+
+      const { reply, actions, usage } = await chatWithTools(
+        systemPrompt, effectiveMessage, contentControls
+      );
+
+      logger.info("TOOL_CHAT_RES", {
+        message: `Tool-calling response [${reqId}]`,
+        reqId,
+        replyLength: reply.length,
+        actions: actions.map(a => a.type),
+        promptTokens: usage?.prompt_tokens,
+        completionTokens: usage?.completion_tokens,
+      });
+
+      // Build response for client
+      const response = { reply, threadId };
+
+      for (const action of actions) {
+        if (action.type === "navigate") {
+          response.navigateTo       = action.tag;
+          response.contentControlId = action.contentControlId;
+        }
+        if (action.type === "update") {
+          response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+        }
+        if (action.type === "insert") {
+          response.insertAction = { tag: action.tag, text: action.text };
+        }
+        if (action.type === "delete") {
+          response.deleteAction = { tag: action.tag, contentControlId: action.contentControlId };
+        }
+      }
 
       return res.json(response);
 
     } catch (err) {
-      logger.error("AGENT_ERR", { message: `Agent error [${reqId}]`, reqId, threadId, error: err.message });
-      // Fall through to stateless chat.completions fallback below
+      logger.error("TOOL_CHAT_ERR", { message: `Tool-calling error [${reqId}]`, reqId, error: err.message });
+      // Fall through to simple prompt agent
     }
   }
 
-  // ── AI path (Azure OpenAI) ──────────────────────────────────────────────
+  // ── Prompt Agent fallback (Chat Completions API) ────────────────────────
   if (aiClient) {
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
@@ -563,7 +1003,6 @@ app.post("/api/chat", async (req, res) => {
         reqId,
         deployment: AZURE_DEPLOYMENT,
         systemPromptLength: systemPrompt.length,
-        systemPrompt,
         userMessage: message
       });
 
@@ -571,7 +1010,7 @@ app.post("/api/chat", async (req, res) => {
         model: AZURE_DEPLOYMENT,
         messages: [
           { role: "system",  content: systemPrompt },
-          { role: "user",    content: message }
+          { role: "user",    content: effectiveMessage }
         ],
         temperature: 0.2,
         max_tokens: 800
@@ -589,11 +1028,10 @@ app.post("/api/chat", async (req, res) => {
         rawReply
       });
 
-      // Strip action JSON from visible reply, parse it for navigation/update
       const action      = parseActionFromReply(rawReply);
       const cleanReply  = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
 
-      const response = { reply: cleanReply };
+      const response = { reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -609,14 +1047,6 @@ app.post("/api/chat", async (req, res) => {
         response.insertAction = { tag: action.tag, text: action.text };
       }
 
-      logger.info("CHAT_RES", {
-        message: `Chat response [${reqId}]`,
-        reqId,
-        replyLength: cleanReply.length,
-        action: action?.action || null,
-        navigateTo: response.navigateTo || null
-      });
-
       return res.json(response);
 
     } catch (err) {
@@ -626,10 +1056,10 @@ app.post("/api/chat", async (req, res) => {
   }
 
   // ── Keyword fallback (no AI configured or AI error) ──────────────────────
-  const msg = message.toLowerCase();
+  const msg = effectiveMessage.toLowerCase();
 
   if (msg.includes("list") || msg.includes("all clause") || msg.includes("show clause") || msg.includes("what clause")) {
-    return res.json({ reply: formatClauseList(contentControls) });
+    return res.json({ reply: formatClauseList(contentControls), threadId });
   }
 
   const findMatch =
@@ -643,29 +1073,31 @@ app.post("/api/chat", async (req, res) => {
       return res.json({
         reply: `Found **${found.tag || found.title}** (ID: ${found.id}).\n\n"${(found.text || "").substring(0, 200)}…"`,
         contentControlId: found.id,
-        navigateTo: found.tag || found.title
+        navigateTo: found.tag || found.title,
+        threadId
       });
     }
-    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.` });
+    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.`, threadId });
   }
 
   const updateMatch = msg.match(/(?:change|update|replace|set)\s+(.+?)\s+(?:from\s+)?["']?(.+?)["']?\s+to\s+["']?(.+?)["']?$/);
   if (updateMatch) {
     return res.json({
       reply: `Updating "${updateMatch[2]}" → "${updateMatch[3]}". Click Apply below.`,
-      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] }
+      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] },
+      threadId
     });
   }
 
   res.json({
-    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`
+    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`,
+    threadId
   });
 });
 
-// ── POST /api/parse-xml-metadata ─────────────────────────────────────────────
-// Accepts raw custom XML strings from Office.js customXmlParts and returns a
-// map of { [ccId]: clauseName } by decoding the Conga GZIP-compressed metadata.
-// Used by the Word add-in to get human-readable clause names (the <Tag> field).
+// ── POST /api/parse-xml-metadata ──────────────────────────────────────────────
+// Accepts { xmlStrings: string[] } — raw customXml strings read from the document
+// by Office.js. Returns { tagMap: { [ccId]: clauseName } } using Conga metadata.
 
 app.post("/api/parse-xml-metadata", (req, res) => {
   const { xmlStrings = [] } = req.body;
@@ -730,8 +1162,7 @@ app.post("/api/risk-scan", async (req, res) => {
     return res.json({ clauses: [] });
   }
 
-  if (!aiClient && !assistantsClient) {
-    // No AI — return unknown risk for all clauses
+  if (!aiClient) {
     return res.json({
       clauses: clauses.map((cc) => ({
         tag: cc.tag || cc.title,
@@ -743,7 +1174,6 @@ app.post("/api/risk-scan", async (req, res) => {
     });
   }
 
-  // Build a compact clause list for the prompt (tag + first 400 chars of text)
   const clauseList = clauses.map((cc, i) =>
     `[${i + 1}] Tag: "${cc.tag || cc.title}" (ID: ${cc.id})\nText: ${cc.text || "(empty)"}`
   ).join("\n\n");
@@ -776,8 +1206,6 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
     });
 
     let raw = completion.choices[0]?.message?.content || "[]";
-
-    // Extract JSON array — strip any markdown code fences first
     raw = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
     let parsed;
     try {
@@ -793,8 +1221,6 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
 
   } catch (err) {
     logger.error("RISK_SCAN_ERR", { message: `Risk scan error [${reqId}]`, reqId, error: err.message });
-
-    // json_object format may not be supported on all deployments — retry without it
     try {
       const completion = await aiClient.chat.completions.create({
         model: AZURE_DEPLOYMENT,
@@ -819,15 +1245,13 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
 // ── POST /api/chat/stream ─────────────────────────────────────────────────────
 // Streaming version of /api/chat — uses Server-Sent Events (SSE).
 // Tokens are emitted as {"type":"token","text":"..."} and the final event is
-// {"type":"done","reply":"...","threadId":"...","action":{...}} (action is optional).
-// The frontend reads the stream with fetch + ReadableStream and renders tokens live.
+// {"type":"done","reply":"...","threadId":"...","updateAction":{...}} (actions optional).
 
 app.post("/api/chat/stream", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
   let threadId = reqThreadId;
   const reqId = Date.now().toString(36);
 
-  // Set SSE headers immediately so the browser can start reading
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -838,70 +1262,6 @@ app.post("/api/chat/stream", async (req, res) => {
   };
   const endStream = () => { if (!res.writableEnded) res.end(); };
 
-  // ── Agent path (Assistants API streaming) ──────────────────────────────────
-  if (assistantsClient && AZURE_AGENT_ID) {
-    try {
-      if (!threadId) {
-        const thread = await assistantsClient.beta.threads.create();
-        threadId = thread.id;
-      }
-
-      await assistantsClient.beta.threads.messages.create(threadId, {
-        role: "user",
-        content: message
-      });
-
-      const docContext = buildDocumentContext(contentControls, docText, null);
-      let fullText = "";
-
-      const runStream = assistantsClient.beta.threads.runs.stream(threadId, {
-        assistant_id: AZURE_AGENT_ID,
-        additional_instructions: docContext
-      });
-
-      runStream.on("textDelta", (delta) => {
-        const token = delta.value || "";
-        if (token) {
-          fullText += token;
-          sendEvent({ type: "token", text: token });
-        }
-      });
-
-      runStream.on("error", (err) => {
-        logger.error("AGENT_STREAM_ERR", { message: `Agent stream error [${reqId}]`, reqId, error: err.message });
-        sendEvent({ type: "error", message: "Stream error — please try again." });
-        endStream();
-      });
-
-      await runStream.finalRun();
-
-      const action     = parseActionFromReply(fullText);
-      const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-      const done = { type: "done", reply: cleanReply, threadId };
-
-      if (action?.action === "navigate") {
-        const found = findClause(action.tag, contentControls);
-        done.navigateTo       = action.tag;
-        done.contentControlId = found?.id;
-      }
-      if (action?.action === "update") {
-        done.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
-      }
-      if (action?.action === "insert") {
-        done.insertAction = { tag: action.tag, text: action.text };
-      }
-
-      sendEvent(done);
-      endStream();
-      return;
-
-    } catch (err) {
-      logger.error("AGENT_STREAM_FAIL", { message: `Agent stream failed [${reqId}], falling back`, reqId, error: err.message });
-      // Fall through to chat.completions
-    }
-  }
-
-  // ── chat.completions path (streaming) ──────────────────────────────────────
   if (aiClient) {
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
@@ -928,7 +1288,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
       const action     = parseActionFromReply(fullText);
       const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-      const done = { type: "done", reply: cleanReply };
+      const done = { type: "done", reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -941,22 +1301,25 @@ app.post("/api/chat/stream", async (req, res) => {
       if (action?.action === "insert") {
         done.insertAction = { tag: action.tag, text: action.text };
       }
+      if (action?.action === "delete") {
+        done.deleteAction = { tag: action.tag };
+      }
 
       sendEvent(done);
       endStream();
       return;
 
     } catch (err) {
-      logger.error("COMPLETIONS_STREAM_FAIL", { message: `Completions stream failed [${reqId}]`, reqId, error: err.message });
+      logger.error("STREAM_FAIL", { message: `Stream failed [${reqId}]`, reqId, error: err.message });
       sendEvent({ type: "error", message: "AI error — please try again." });
       endStream();
       return;
     }
   }
 
-  // ── Keyword fallback (no AI) ───────────────────────────────────────────────
+  // Keyword fallback
   const msg_lc = message.toLowerCase();
-  let fallbackReply = `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"`;
+  let fallbackReply = "⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.";
   if (msg_lc.includes("list") || msg_lc.includes("all clause") || msg_lc.includes("show clause")) {
     fallbackReply = formatClauseList(contentControls);
   }
@@ -1099,15 +1462,15 @@ ${text}`;
 // ── GET /api/health ───────────────────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "Conga AI Assistance API", timestamp: new Date().toISOString() });
+  res.json({ status: "ok", service: "DocSense AI Mock API", timestamp: new Date().toISOString() });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  logger.info("STARTUP", { message: `Conga AI Assistance API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
-  console.log(`\nConga AI Assistance  →  http://localhost:${PORT}`);
+  logger.info("STARTUP", { message: `DocSense AI API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
+  console.log(`\nDocSense AI Mock API  →  http://localhost:${PORT}`);
   console.log(`Health check         →  http://localhost:${PORT}/api/health`);
   console.log(`Logs                 →  ${LOGS_DIR}\n`);
 });

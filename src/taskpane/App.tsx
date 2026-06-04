@@ -30,7 +30,6 @@ interface ContentControl {
   markedForDeletion?: string; // "true" = pending removal
   action?: string;         // "Inserted" | "Deleted" | "Replaced"
   clauseMarkup?: string;   // clause OOXML markup
-  clauseName?: string;     // human-readable name from Conga custom XML <Tag> field
 }
 
 interface Message {
@@ -56,12 +55,9 @@ interface InsertAction {
   text: string;  // full text of the new clause
 }
 
-interface RiskResult {
+interface DeleteAction {
   tag: string;
-  id: number;
-  riskLevel: "high" | "medium" | "low" | "unknown";
-  reason: string;
-  riskFactors: string[];
+  contentControlId?: number;
 }
 
 interface Suggestion {
@@ -79,7 +75,7 @@ export default function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "Hi! I'm Conga AI Assistance. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\""
+      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\"\n• \"End Review\""
     }
   ]);
   const [input, setInput] = useState("");
@@ -99,8 +95,6 @@ export default function App() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  // Conga custom XML tag map: { [ccId]: clauseName } — persists across refreshes
-  const tagMapRef = useRef<Record<string, string>>({});
 
   // ── Initialise Office.js ──────────────────────────────────────────────────
 
@@ -119,110 +113,48 @@ export default function App() {
 
   // ── Read content controls from the open Word document ────────────────────
 
-  // ── Silently re-read content controls without posting a system message ──────
-  // Used after updates/inserts to keep state fresh without spamming the chat.
-  const refreshContentControls = async () => {
-    try {
-      await Word.run(async (context) => {
-        const ccs = context.document.contentControls;
-        ccs.load("items/id,items/tag,items/title,items/text,items/cannotEdit,items/cannotDelete,items/placeholderText");
-        await context.sync();
-
-        const CONGA_TYPES = new Set(["clause", "field", "repeat", "segment"]);
-        const tagMap = tagMapRef.current;
-        const loaded: ContentControl[] = ccs.items
-          .filter((cc) => cc.tag || CONGA_TYPES.has((cc.title || "").toLowerCase()))
-          .map((cc) => ({
-            id: cc.id,
-            tag: cc.tag || "",
-            title: cc.tag
-              ? `${cc.tag}${cc.title ? " (" + cc.title + ")" : ""}`
-              : cc.title || "Unnamed",
-            text: cc.text || "",
-            type: cc.title || "",
-            cannotEdit: cc.cannotEdit || false,
-            cannotDelete: cc.cannotDelete || false,
-            placeholderText: cc.placeholderText || "",
-            clauseName: tagMap[cc.id.toString()] || tagMap[String(cc.id >>> 0)] || undefined
-          }));
-        setContentControls(loaded);
-      });
-    } catch { /* silent — non-critical */ }
-  };
-
   const loadDocumentMetadata = async () => {
-    setThreadId(null); // new document load = fresh conversation session
-    let loaded: ContentControl[] = [];
-    let xmlStrings: string[] = [];
-    let clauseCount = 0, fieldCount = 0;
-
     try {
       await Word.run(async (context) => {
         const ccs = context.document.contentControls;
         // Load richer properties matching XAuthor's ContentControlInfo model
         ccs.load("items/id,items/tag,items/title,items/text,items/cannotEdit,items/cannotDelete,items/placeholderText");
-        const parts = context.document.customXmlParts;
-        parts.load("items/id"); // prime the collection
         await context.sync();
 
         const CONGA_TYPES = new Set(["clause", "field", "repeat", "segment"]);
 
-        loaded = ccs.items
+        const loaded: ContentControl[] = ccs.items
           // Keep only Conga-tagged controls or those with a recognised Conga title
           .filter((cc) => cc.tag || CONGA_TYPES.has((cc.title || "").toLowerCase()))
           .map((cc) => ({
             id: cc.id,
-            // cc.tag   = w:tag  — numeric record ID in Conga CLM docs
-            // cc.title = w:alias — the Conga type (e.g. "Clause", "Field", "Repeat")
+            // cc.tag   = w:tag  — the clause/field name (e.g. "Payment Terms")
+            // cc.title = w:alias — the Conga type  (e.g. "Clause", "Field", "Repeat")
             tag: cc.tag || "",
             title: cc.tag
               ? `${cc.tag}${cc.title ? " (" + cc.title + ")" : ""}`
               : cc.title || "Unnamed",
-            text: cc.text || "",
+            text: cc.text ? cc.text.substring(0, 300) : "",
             type: cc.title || "",
             cannotEdit: cc.cannotEdit || false,
             cannotDelete: cc.cannotDelete || false,
             placeholderText: cc.placeholderText || ""
           }));
 
-        clauseCount = loaded.filter((cc) => (cc.type || "").toLowerCase() === "clause").length;
-        fieldCount  = loaded.filter((cc) => (cc.type || "").toLowerCase() === "field").length;
+        setContentControls(loaded);
 
-        // Read raw custom XML parts — Conga stores GZIP-compressed metadata here
-        const xmlResults = parts.items.map((p) => p.getXml());
-        await context.sync();
-        xmlStrings = xmlResults.map((r) => r.value).filter(Boolean);
+        const clauses = loaded.filter((cc) => (cc.type || "").toLowerCase() === "clause");
+        const fields  = loaded.filter((cc) => (cc.type || "").toLowerCase() === "field");
+
+        addSystemMessage(
+          loaded.length > 0
+            ? `Document loaded — found ${clauses.length} clause${clauses.length !== 1 ? "s" : ""} and ${fields.length} field${fields.length !== 1 ? "s" : ""}.`
+            : "Document loaded — no Conga content controls found. Open a Conga contract document."
+        );
       });
     } catch {
       addSystemMessage("Could not read document. Make sure a Word document is open.");
-      return;
     }
-
-    // Enrich content controls with human-readable clause names from Conga metadata
-    if (xmlStrings.length) {
-      try {
-        const resp = await fetch(`${API_URL}/api/parse-xml-metadata`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ xmlStrings })
-        });
-        if (resp.ok) {
-          const { tagMap = {} } = await resp.json();
-          tagMapRef.current = tagMap; // persist for use in refreshContentControls
-          loaded = loaded.map((cc) => ({
-            ...cc,
-            clauseName: tagMap[cc.id.toString()] || tagMap[String(cc.id >>> 0)] || undefined
-          }));
-        }
-      } catch { /* non-fatal — display falls back to text snippet */ }
-    }
-
-    setContentControls(loaded);
-    addSystemMessage(
-      loaded.length > 0
-        ? `Document loaded — found ${clauseCount} clause${clauseCount !== 1 ? "s" : ""} and ${fieldCount} field${fieldCount !== 1 ? "s" : ""}.`
-        : "Document loaded — no Conga content controls found. Open a Conga contract document."
-    );
   };
 
   // ── Navigate Word to a specific content control ──────────────────────────
@@ -251,7 +183,7 @@ export default function App() {
         para.font.bold = false;
         await context.sync();
         addSystemMessage(`✅ New clause "${action.tag}" inserted at the end of the document.`);
-        refreshContentControls();
+        loadDocumentMetadata();
       });
     } catch (err) {
       addSystemMessage(`Failed to insert clause: ${err}`);
@@ -516,24 +448,21 @@ export default function App() {
       { id: `sys-${Date.now()}`, role: "system", text }
     ]);
 
-  // ── Send a chat message to the API (streaming) ────────────────────────────
+  // ── Send a chat message to the API ────────────────────────────────────────
 
-  const sendMessage = async () => {
-    const text = input.trim();
+  const sendMessage = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
 
     setInput("");
-    const assistantMsgId = `a-${Date.now()}`;
-
     setMessages((prev) => [
       ...prev,
       { id: `u-${Date.now()}`, role: "user", text }
     ]);
     setLoading(true);
-    setIsStreaming(false);
 
     try {
-      const response = await fetch(`${API_URL}/api/chat/stream`, {
+      const response = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -544,77 +473,57 @@ export default function App() {
         })
       });
 
-      if (!response.ok || !response.body) throw new Error(`API ${response.status}`);
+      if (!response.ok) throw new Error(`API ${response.status}`);
 
-      const reader  = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer       = "";
-      let streamedText = "";
-      let placeholderAdded = false;
+      const data: { reply: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; deleteAction?: DeleteAction; threadId?: string } = await response.json();
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      // Persist thread ID for multi-turn conversation
+      if (data.threadId) {
+        setThreadId(data.threadId);
+      }
 
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() ?? "";
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          text: data.reply || (data.updateAction ? `Updating "${data.updateAction.find}" → "${data.updateAction.replace}" in ${data.updateAction.tag}…` : data.insertAction ? `Inserting clause "${data.insertAction.tag}"…` : "Done."),
+          contentControlId: data.contentControlId
+        }
+      ]);
 
-        for (const part of parts) {
-          if (!part.startsWith("data: ")) continue;
-          let event: { type: string; text?: string; reply?: string; threadId?: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; message?: string };
-          try { event = JSON.parse(part.slice(6)); } catch { continue; }
+      if (data.contentControlId) {
+        await navigateToClause(data.contentControlId);
+      }
 
-          if (event.type === "token") {
-            streamedText += event.text ?? "";
-            if (!placeholderAdded) {
-              // First token — add the placeholder message and start streaming
-              placeholderAdded = true;
-              setIsStreaming(true);
-              setMessages((prev) => [
-                ...prev,
-                { id: assistantMsgId, role: "assistant", text: streamedText }
-              ]);
-            } else {
-              setMessages((prev) =>
-                prev.map((m) => m.id === assistantMsgId ? { ...m, text: streamedText } : m)
-              );
-            }
+      if (data.updateAction) {
+        await updateClause(data.updateAction);
+      }
 
-          } else if (event.type === "done") {
-            const finalText = event.reply ?? streamedText;
-            if (!placeholderAdded) {
-              // No tokens were streamed (e.g. keyword fallback) — add message now
-              setMessages((prev) => [
-                ...prev,
-                { id: assistantMsgId, role: "assistant", text: finalText, contentControlId: event.contentControlId }
-              ]);
-            } else {
-              // Replace streamed text with clean reply (action JSON stripped out)
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantMsgId
-                    ? { ...m, text: finalText, contentControlId: event.contentControlId }
-                    : m
-                )
-              );
-            }
+      if (data.insertAction) {
+        await insertClause(data.insertAction);
+      }
 
-            if (event.threadId) setThreadId(event.threadId);
-            if (event.contentControlId) await navigateToClause(event.contentControlId);
-            if (event.updateAction)     await updateClause(event.updateAction);
-            if (event.insertAction)     await insertClause(event.insertAction);
-
-          } else if (event.type === "error") {
-            const errText = event.message ?? "An error occurred. Please try again.";
-            if (!placeholderAdded) {
-              setMessages((prev) => [...prev, { id: assistantMsgId, role: "assistant", text: errText }]);
-            } else {
-              setMessages((prev) =>
-                prev.map((m) => m.id === assistantMsgId ? { ...m, text: errText } : m)
-              );
-            }
+      if (data.deleteAction) {
+        const cc = contentControls.find(
+          (c) => c.tag === data.deleteAction!.tag ||
+                 c.tag.toLowerCase() === data.deleteAction!.tag.toLowerCase() ||
+                 c.id === data.deleteAction!.contentControlId
+        );
+        if (cc) {
+          try {
+            await Word.run(async (context) => {
+              const wordCc = context.document.contentControls.getById(cc.id);
+              wordCc.delete(false);
+              await context.sync();
+              addSystemMessage(`✅ Deleted clause "${cc.tag}".`);
+              loadDocumentMetadata();
+            });
+          } catch (err) {
+            addSystemMessage(`Failed to delete clause: ${err}`);
           }
+        } else {
+          addSystemMessage(`Could not find clause "${data.deleteAction.tag}" to delete.`);
         }
       }
     } catch {
@@ -628,7 +537,6 @@ export default function App() {
       ]);
     } finally {
       setLoading(false);
-      setIsStreaming(false);
       inputRef.current?.focus();
     }
   };
@@ -636,6 +544,10 @@ export default function App() {
   const quickAction = (prompt: string) => {
     setInput(prompt);
     inputRef.current?.focus();
+  };
+
+  const quickActionAndSend = (prompt: string) => {
+    void sendMessage(prompt);
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -647,7 +559,7 @@ export default function App() {
       <div className="header">
         <div className="header-title">
           <span className="header-icon">⚡</span>
-          <span>Conga AI Assistance</span>
+          <span>DocSense AI</span>
         </div>
         <div className="header-right">
           <button
@@ -886,8 +798,8 @@ export default function App() {
           </div>
         ))}
 
-        {/* Typing indicator — shown while connecting, hidden once tokens arrive */}
-        {loading && !isStreaming && (
+        {/* Typing indicator */}
+        {loading && (
           <div className="message message-assistant">
             <div className="message-bubble typing">
               <span />
@@ -902,14 +814,7 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
-        <button
-          className={`risk-scan-btn${riskLoading ? " risk-scan-btn-loading" : ""}`}
-          onClick={scanRisk}
-          disabled={riskLoading || !contentControls.length}
-          title="Scan all clauses for risk"
-        >
-          {riskLoading ? "⏳ Scanning…" : "⚠️ Risk Scan"}
-        </button>
+        <button onClick={() => quickAction("End review for reviewtype=Office365 reviewid= reviewerid=")}>End Review</button>
         <button onClick={() => quickAction("List all clauses in this document")}>
           List Clauses
         </button>
@@ -937,7 +842,7 @@ export default function App() {
           placeholder="Ask about this document…"
           disabled={loading}
         />
-        <button onClick={sendMessage} disabled={loading || !input.trim()}>
+        <button onClick={() => void sendMessage()} disabled={loading || !input.trim()}>
           {loading ? "…" : "Send"}
         </button>
       </div>
