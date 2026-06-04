@@ -79,7 +79,7 @@ export default function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "Hi! I'm Conga AI Assistance. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\""
+      text: "Hi! I'm Conga AI Assistance. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\"\n• \"End Review\""
     }
   ]);
   const [input, setInput] = useState("");
@@ -408,6 +408,32 @@ export default function App() {
     setMessages(prev => prev.map(m =>
       m.id === msgId ? { ...m, pendingEdit: undefined, text: `✕ Edit cancelled for "${ccName}".` } : m
     ));
+  };
+
+  // ── End Review (direct API call) ─────────────────────────────────────────
+
+  const [endReviewLoading, setEndReviewLoading] = useState(false);
+
+  const endReview = async () => {
+    if (endReviewLoading) return;
+    setEndReviewLoading(true);
+    addSystemMessage("⏳ Ending review…");
+    try {
+      const response = await fetch(`${API_URL}/api/end-review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await response.json();
+      if (data.success) {
+        addSystemMessage("✅ Review ended successfully.");
+      } else {
+        addSystemMessage(`❌ End review failed: ${data.error || "Unknown error"}`);
+      }
+    } catch (err) {
+      addSystemMessage("❌ Could not reach the API. Make sure the server is running.");
+    } finally {
+      setEndReviewLoading(false);
+    }
   };
 
   // ── Clause risk scan ──────────────────────────────────────────────────────
@@ -902,6 +928,9 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
+        <button onClick={endReview} disabled={endReviewLoading}>
+          {endReviewLoading ? "⏳ Ending…" : "End Review"}
+        </button>
         <button
           className={`risk-scan-btn${riskLoading ? " risk-scan-btn-loading" : ""}`}
           onClick={scanRisk}

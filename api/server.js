@@ -1,5 +1,5 @@
 /**
- * DocSense AI — API Server
+ * Conga AI Assistance — API Server
  *
  * POST /api/chat        — AI chat endpoint (Azure OpenAI with keyword fallback)
  * POST /api/metadata    — parse uploaded .docx and return content controls
@@ -89,7 +89,7 @@ if (aiClient) {
   console.warn("Azure OpenAI not configured — using keyword fallback. Set AZURE_OPENAI_* in api/.env");
 }
 
-// ── Azure AI Agent (Assistants API) client ────────────────────────────────
+// ── Azure AI Agent (Assistants API) client ────────────────────────────────────
 // Run `node create-agent.js` once to create the agent, then set AZURE_AGENT_ID in .env.
 // When configured, uses persistent threads for true multi-turn conversation memory.
 // Falls back to stateless chat.completions if AZURE_AGENT_ID is not set.
@@ -112,6 +112,317 @@ if (assistantsClient) {
 } else {
   console.log("Azure AI Agent not configured — set AZURE_AGENT_ID in .env to enable persistent threads");
 }
+
+// ── Tool-calling mode flag ─────────────────────────────────────────────────────
+// When MCP tools are discovered, we use Chat Completions with function calling
+// so the model can invoke Conga API tools + document tools in a single loop.
+const AGENT_ID = AZURE_AGENT_ID;
+if (AGENT_ID) {
+  console.log(`Agent ID configured: ${AGENT_ID} (using Chat Completions + tool calling)`);
+}
+
+// In-memory thread store: threadId → { created, lastUsed }
+const activeThreads = new Map();
+
+// ── Foundry Toolbox MCP client ─────────────────────────────────────────────
+const FOUNDRY_TOOLBOX_URL = process.env.FOUNDRY_TOOLBOX_URL || "";
+
+async function callFoundryToolbox(method, params = {}) {
+  if (!FOUNDRY_TOOLBOX_URL) {
+    throw new Error("FOUNDRY_TOOLBOX_URL not configured in .env");
+  }
+
+  const body = {
+    jsonrpc: "2.0",
+    id: `req-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    method,
+    params,
+  };
+
+  const res = await fetch(FOUNDRY_TOOLBOX_URL, {
+    method: "POST",
+    headers: {
+      "api-key": AZURE_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) throw new Error(`Foundry toolbox ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : { success: true };
+}
+
+if (FOUNDRY_TOOLBOX_URL) {
+  console.log(`Foundry Toolbox MCP → ${FOUNDRY_TOOLBOX_URL.split("?")[0]}...`);
+}
+
+// ── Conga token provider (auto-auth for review tools) ─────────────────────
+const CONGA_CLIENT_ID     = process.env.CONGA_CLIENT_ID || "";
+const CONGA_CLIENT_SECRET = process.env.CONGA_CLIENT_SECRET || "";
+const CONGA_SCOPE         = process.env.CONGA_SCOPE || "sign";
+const CONGA_AUTH_URL      = process.env.CONGA_AUTH_URL || "https://login-rlsdev.congacloud.io/api/v1/auth/connect/token";
+
+let cachedCongaToken   = "";
+let congaTokenExpiresAt = 0;
+let inflightTokenReq    = null;
+
+async function getCongaToken() {
+  if (cachedCongaToken && Date.now() < congaTokenExpiresAt - 30000) {
+    return cachedCongaToken;
+  }
+  if (inflightTokenReq) return inflightTokenReq;
+
+  inflightTokenReq = (async () => {
+    if (!CONGA_CLIENT_ID || !CONGA_CLIENT_SECRET) {
+      throw new Error("CONGA_CLIENT_ID / CONGA_CLIENT_SECRET not configured");
+    }
+    const body = new URLSearchParams({
+      client_id:     CONGA_CLIENT_ID,
+      client_secret: CONGA_CLIENT_SECRET,
+      scope:         CONGA_SCOPE,
+      grant_type:    "client_credentials",
+    });
+    const res = await fetch(CONGA_AUTH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Conga auth failed (${res.status}): ${text}`);
+    const json = JSON.parse(text);
+    cachedCongaToken    = json.access_token;
+    const expiresIn     = json.expires_in || 3600;
+    congaTokenExpiresAt = Date.now() + expiresIn * 1000;
+    logger.info("CONGA_AUTH", { message: `Token acquired, expires in ${expiresIn}s` });
+    return cachedCongaToken;
+  })().finally(() => { inflightTokenReq = null; });
+
+  return inflightTokenReq;
+}
+
+/** Inject Conga bearer token for congaendreviewtool___ tool calls */
+async function maybeInjectAuth(toolName, args) {
+  const needsAuth = toolName.startsWith("congaendreviewtool___");
+  if (!needsAuth) return args;
+  if (args.Authorization && String(args.Authorization).trim()) return args;
+  try {
+    const token = await getCongaToken();
+    return { ...args, Authorization: `Bearer ${token}` };
+  } catch (err) {
+    logger.warn("TOKEN", { message: `Auth injection failed: ${err.message}` });
+    return args;
+  }
+}
+
+/**
+ * Call getReviewAuthorization via MCP to obtain the ExternalToken needed
+ * by the endReviewerReview endpoint (Office365 flow).
+ */
+async function getReviewExternalToken(reviewtype) {
+  const token = await getCongaToken();
+  const authResult = await callFoundryToolbox("tools/call", {
+    name: "congaendreviewtool___getReviewAuthorization",
+    arguments: {
+      reviewtype: reviewtype || "Office365",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  // Extract external token from MCP response
+  let externalToken = "";
+  try {
+    const payload = authResult?.result;
+
+    // Log the content parts specifically (not the huge _meta block)
+    if (payload?.content) {
+      const contentTexts = payload.content.map(c => c.text || "").join("");
+      logger.info("REVIEW_AUTH", { message: "Response content", content: contentTexts.substring(0, 2000) });
+    } else {
+      logger.info("REVIEW_AUTH", { message: "Full response (no content array)", result: JSON.stringify(authResult).substring(0, 2000) });
+    }
+
+    if (payload?.content) {
+      // MCP content array format: [{ type: "text", text: "..." }]
+      const textContent = payload.content.find(c => c.type === "text");
+      if (textContent && textContent.text) {
+        const raw = textContent.text.trim();
+        // Try parsing as JSON
+        try {
+          const parsed = JSON.parse(raw);
+          // Conga Review API returns: { Value: { Token: { AuthToken: "..." } } }
+          externalToken = parsed?.Value?.Token?.AuthToken
+            || parsed?.value?.token?.authToken
+            || parsed.externalToken || parsed.ExternalToken
+            || parsed.token || parsed.Token
+            || parsed.access_token || parsed.accessToken
+            || parsed.authUrl || parsed.authURL || parsed.auth_url
+            || "";
+          // If parsed is a plain string, use it directly
+          if (!externalToken && typeof parsed === "string") externalToken = parsed;
+          // If parsed has a nested data/value object
+          if (!externalToken && parsed.data) {
+            externalToken = parsed.data.externalToken || parsed.data.token || parsed.data.access_token || "";
+          }
+          // If parsed has a redirectUrl with token in query params
+          if (!externalToken && (parsed.redirectUrl || parsed.url)) {
+            const url = parsed.redirectUrl || parsed.url;
+            const match = url.match(/[?&](?:token|code|access_token)=([^&]+)/i);
+            if (match) externalToken = decodeURIComponent(match[1]);
+            else externalToken = url; // pass the whole URL as external token
+          }
+        } catch {
+          // Not JSON — use the raw text as the token
+          externalToken = raw;
+        }
+      }
+    } else if (typeof payload === "string") {
+      externalToken = payload;
+    }
+  } catch (err) {
+    logger.warn("REVIEW_AUTH", { message: `Could not parse external token: ${err.message}` });
+  }
+
+  if (externalToken) {
+    logger.info("REVIEW_AUTH", { message: `ExternalToken obtained (${externalToken.length} chars)` });
+  } else {
+    logger.warn("REVIEW_AUTH", { message: "ExternalToken could not be extracted from response" });
+  }
+  return externalToken;
+}
+
+// Warm up Conga token on startup if credentials are set
+if (CONGA_CLIENT_ID && CONGA_CLIENT_SECRET) {
+  getCongaToken().catch(() => {});
+  console.log("Conga auth configured → tokens will be provisioned automatically");
+}
+
+// ── Tool definitions for the Hosted Agent ──────────────────────────────────
+// These are passed to createAndPoll so the agent knows it can call tools.
+
+const DOCUMENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "navigate_to_clause",
+      description: "Navigate to a specific clause or field in the document by tag name.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause or field to navigate to." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_clause",
+      description: "Update/replace text within a clause. Provide the exact text to find and its replacement.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:     { type: "string", description: "The tag name of the clause to update." },
+          find:    { type: "string", description: "The exact text to find (must not be empty)." },
+          replace: { type: "string", description: "The replacement text." },
+        },
+        required: ["tag", "find", "replace"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "insert_clause",
+      description: "Insert a brand new clause or section into the document.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag:  { type: "string", description: "Name/tag for the new clause." },
+          text: { type: "string", description: "Full text content of the new clause." },
+        },
+        required: ["tag", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_clause",
+      description: "Delete a clause or content control from the document.",
+      parameters: {
+        type: "object",
+        properties: { tag: { type: "string", description: "The tag name of the clause to delete." } },
+        required: ["tag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_clauses",
+      description: "List all content controls (clauses and fields) found in the document.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_clause",
+      description: "Search for a clause or field by keyword.",
+      parameters: {
+        type: "object",
+        properties: { keyword: { type: "string", description: "The keyword to search for." } },
+        required: ["keyword"],
+      },
+    },
+  },
+];
+
+// ── Dynamic MCP tool discovery ────────────────────────────────────────────
+// Fetches available tools from the Foundry Toolbox MCP endpoint on startup
+// and converts them to OpenAI function-tool format so the agent can call them.
+
+let mcpToolDefs = []; // populated by discoverMcpTools()
+
+function convertMcpToolToOpenAI(mcpTool) {
+  const schema = mcpTool.inputSchema || { type: "object", properties: {} };
+  // Remove auth-related params since we auto-inject them server-side
+  const AUTO_INJECTED = new Set(["Authorization", "ExternalToken"]);
+  const required = (schema.required || []).filter(r => !AUTO_INJECTED.has(r));
+  // Also strip them from properties so the model never tries to supply them
+  const properties = { ...(schema.properties || {}) };
+  for (const key of AUTO_INJECTED) delete properties[key];
+  return {
+    type: "function",
+    function: {
+      name: mcpTool.name,
+      description: mcpTool.description || `MCP tool: ${mcpTool.name}`,
+      parameters: {
+        type: "object",
+        properties,
+        ...(required.length ? { required } : {}),
+      },
+    },
+  };
+}
+
+async function discoverMcpTools() {
+  if (!FOUNDRY_TOOLBOX_URL) return;
+  try {
+    const response = await callFoundryToolbox("tools/list");
+    const tools = response?.result?.tools || [];
+    // Only keep review tools (congaendreviewtool___*); skip congaapitools___ and congaauth___
+    const KEEP_PREFIXES = ["congaendreviewtool___"];
+    const filtered = tools.filter(t => KEEP_PREFIXES.some(p => t.name.startsWith(p)));
+    mcpToolDefs = filtered.map(convertMcpToolToOpenAI);
+    console.log(`MCP tool discovery → found ${tools.length} tools, kept ${mcpToolDefs.length}: ${mcpToolDefs.map(t => t.function.name).join(", ")}`);
+  } catch (err) {
+    console.error(`MCP tool discovery failed: ${err.message}`);
+  }
+}
+
+// Run discovery on startup
+discoverMcpTools();
 
 const app     = express();
 const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -363,8 +674,11 @@ function parseCustomXmlMetadata(zip) {
 function buildSystemPrompt(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
-    const name    = cc.tag   || cc.title || "Unnamed";
-    const preview = cc.text  || "(no text)";
+    // Use human-readable clauseName when available; fall back to numeric tag
+    const name    = cc.clauseName
+      ? `${cc.clauseName} [Tag: ${cc.tag}]`
+      : (cc.tag || cc.title || "Unnamed");
+    const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
 
     // Surface key metadata flags so the AI understands the contract state
     const flags = [
@@ -386,14 +700,14 @@ function buildSystemPrompt(contentControls, docText, documentProps) {
     ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}`
     : "";
 
-  const docSnippet = docText || "";
+  const docSnippet = docText ? docText.substring(0, 3000) : "";
 
   return `You are Conga AI Assistance, a contract intelligence assistant for Conga CLM contracts.
 ${documentProps ? `\nDocument Properties:\n${Object.entries(documentProps).map(([k,v]) => `  ${k}: ${v}`).join("\n")}\n` : ""}
 The document currently open has the following content controls (clauses and fields):
 ${ccLines || "(none detected yet)"}
 
-Full document text:
+Full document text (first 3000 chars):
 ${docSnippet || "(not available)"}
 
 Your job:
@@ -408,16 +722,25 @@ Your job:
 5. If the user asks to insert or add a BRAND NEW clause or section to the document, include:
    {"action":"insert","tag":"<new clause name>","text":"<full text of the new clause>"}
 6. If the user asks to list clauses or fields, list them clearly.
-7. Be concise. Do not hallucinate content not present in the document.`;
+7. Be concise. Do not hallucinate content not present in the document.
+
+IMPORTANT — Conga API tools:
+• Authentication (Authorization header, ExternalToken) is handled AUTOMATICALLY by the server. NEVER ask the user for tokens, credentials, client_id, client_secret, or any auth details.
+• For congaendreviewtool___endReviewerReview: just call it with reviewtype, reviewid, and reviewerid. The server will automatically fetch the ExternalToken (via getReviewAuthorization) and inject the Authorization header. NEVER ask the user for ExternalToken or Authorization.
+• For congaendreviewtool___getReviewAuthorization: just call it with reviewtype. Authorization is injected automatically.
+• NEVER call congaauth___createBearerToken manually — the app handles authentication behind the scenes.
+• Only ask the user for BUSINESS parameters (reviewid, reviewerid, reviewtype, etc.).`;
 }
 
-// ── Build per-request document context (dynamic part only) ──────────────────
-// Used with the Assistants API — static behavior rules live on the agent itself.
-// Only the live document state is sent per request via `additional_instructions`.
+// ── Build document context string for agent streaming ─────────────────────────
+
 function buildDocumentContext(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
-    const name    = cc.tag   || cc.title || "Unnamed";
+    // Use human-readable clauseName when available; fall back to numeric tag
+    const name    = cc.clauseName
+      ? `${cc.clauseName} [Tag: ${cc.tag}]`
+      : (cc.tag || cc.title || "Unnamed");
     const text    = cc.text  || "(no text)";
     const flags = [
       cc.SubType             ? `SubType:${cc.SubType}`                : null,
@@ -451,14 +774,200 @@ function parseActionFromReply(reply) {
   return null;
 }
 
+// ── Chat Completions + Tool Calling loop ─────────────────────────────────────
+// Handles tool calls from Chat Completions API. Document tools are resolved
+// locally; MCP tools are proxied to the Foundry Toolbox endpoint.
+
+async function executeToolCall(toolCall, contentControls) {
+  const name = toolCall.function.name;
+  let args;
+  try { args = JSON.parse(toolCall.function.arguments); } catch { args = {}; }
+  let action = null;
+  let result = "";
+
+  switch (name) {
+    case "navigate_to_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "navigate", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id, text: (found.text || "").substring(0, 200) });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found in the document.` });
+      }
+      break;
+    }
+    case "update_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "update", tag: args.tag, find: args.find, replace: args.replace };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "insert_clause": {
+      action = { type: "insert", tag: args.tag, text: args.text };
+      result = JSON.stringify({ success: true, tag: args.tag });
+      break;
+    }
+    case "delete_clause": {
+      const found = findClause(args.tag, contentControls);
+      if (found) {
+        action = { type: "delete", tag: found.tag || found.title, contentControlId: found.id };
+        result = JSON.stringify({ success: true, tag: found.tag, id: found.id });
+      } else {
+        result = JSON.stringify({ success: false, error: `Clause "${args.tag}" not found.` });
+      }
+      break;
+    }
+    case "list_clauses": {
+      result = formatClauseList(contentControls);
+      break;
+    }
+    case "search_clause": {
+      const found = findClause(args.keyword, contentControls);
+      if (found) {
+        result = JSON.stringify({ found: true, tag: found.tag, id: found.id, type: found.type, text: (found.text || "").substring(0, 300) });
+      } else {
+        result = JSON.stringify({ found: false, message: `No clause matching "${args.keyword}" found.` });
+      }
+      break;
+    }
+    case "congaendreviewtool___endReviewerReview": {
+      // Orchestrated flow: get ExternalToken via authorize, then call end review
+      const reviewtype = args.reviewtype || "Office365";
+      const reviewid = args.reviewid || "";
+      const reviewerid = args.reviewerid || "";
+      if (!reviewid || !reviewerid) {
+        result = JSON.stringify({ success: false, error: "reviewid and reviewerid are required" });
+        break;
+      }
+      try {
+        // Step 1: Get ExternalToken via getReviewAuthorization
+        let externalToken = args.ExternalToken || "";
+        if (!externalToken) {
+          logger.info("REVIEW_FLOW", { message: `Fetching ExternalToken for reviewtype=${reviewtype}` });
+          externalToken = await getReviewExternalToken(reviewtype);
+          if (!externalToken) {
+            logger.warn("REVIEW_FLOW", { message: "ExternalToken could not be obtained from authorize endpoint" });
+          }
+        }
+        // Step 2: Call endReviewerReview with all params + ExternalToken
+        const enrichedArgs = await maybeInjectAuth(name, {
+          ...args,
+          reviewtype,
+          reviewid,
+          reviewerid,
+          ExternalToken: externalToken,
+        });
+        logger.info("REVIEW_FLOW", { message: `Calling endReviewerReview: reviewid=${reviewid}, reviewerid=${reviewerid}` });
+        const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
+        logger.info("REVIEW_FLOW", { message: "endReviewerReview completed", result: JSON.stringify(mcpResult).substring(0, 500) });
+        result = JSON.stringify({ success: true, result: mcpResult });
+      } catch (err) {
+        logger.error("REVIEW_FLOW", { message: `endReviewerReview failed: ${err.message}` });
+        result = JSON.stringify({ success: false, error: err.message });
+      }
+      break;
+    }
+    default: {
+      // Route unknown tools through Foundry Toolbox MCP endpoint
+      if (FOUNDRY_TOOLBOX_URL) {
+        try {
+          const enrichedArgs = await maybeInjectAuth(name, args);
+          const mcpResult = await callFoundryToolbox("tools/call", {
+            name,
+            arguments: enrichedArgs,
+          });
+          logger.info("MCP_TOOL", { message: `MCP tool: ${name}`, result: JSON.stringify(mcpResult).substring(0, 500) });
+          result = JSON.stringify({ success: true, result: mcpResult });
+        } catch (err) {
+          logger.error("MCP_TOOL", { message: `MCP tool failed: ${name}`, error: err.message });
+          result = JSON.stringify({ success: false, error: err.message });
+        }
+      } else {
+        logger.warn("TOOL_CALL", { message: `Unknown tool: ${name}`, args });
+        result = JSON.stringify({ error: `Unknown tool: ${name}`, args });
+      }
+    }
+  }
+
+  return { result, action };
+}
+
+/**
+ * Run Chat Completions with a tool-call loop.
+ * The model can call document tools or MCP tools; we execute them and feed
+ * the results back until the model produces a final text response.
+ */
+async function chatWithTools(systemPrompt, userMessage, contentControls, history) {
+  const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
+  const messages = history && history.length
+    ? [{ role: "system", content: systemPrompt }, ...history]
+    : [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userMessage },
+      ];
+
+  const actions = [];
+  let maxIterations = 10; // safety limit
+
+  while (maxIterations-- > 0) {
+    const completion = await aiClient.chat.completions.create({
+      model: AZURE_DEPLOYMENT,
+      messages,
+      tools: allTools.length ? allTools : undefined,
+      temperature: 0.2,
+      max_tokens: 1500,
+    });
+
+    const choice = completion.choices[0];
+    const assistantMsg = choice.message;
+
+    // If no tool calls, we're done
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      return {
+        reply: assistantMsg.content || "No response.",
+        actions,
+        usage: completion.usage,
+      };
+    }
+
+    // Push assistant message (with tool_calls) to conversation
+    messages.push({
+      role: "assistant",
+      content: assistantMsg.content ?? "",
+      tool_calls: assistantMsg.tool_calls,
+    });
+
+    const toolNames = assistantMsg.tool_calls.map(tc => tc.function.name);
+    logger.info("TOOL_CALLS", { message: `Model calling tools: ${toolNames.join(", ")}` });
+
+    // Execute each tool call and push results
+    for (const tc of assistantMsg.tool_calls) {
+      const { result, action } = await executeToolCall(tc, contentControls);
+      if (action) actions.push(action);
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: result,
+      });
+      logger.debug("TOOL_RESULT", { message: `Tool ${tc.function.name}`, result: result.substring(0, 300) });
+    }
+  }
+
+  // If we exhausted iterations, return the last content
+  return { reply: "Tool call loop exceeded maximum iterations.", actions, usage: null };
+}
+
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
   let threadId = reqThreadId;
-  const reqId = Date.now().toString(36); // short request ID for correlation
+  const reqId = Date.now().toString(36);
 
-  // Log the incoming chat request
   logger.info("CHAT_REQ", {
     message: `Chat request [${reqId}]`,
     reqId,
@@ -470,22 +979,18 @@ app.post("/api/chat", async (req, res) => {
   });
 
   // ── Agent path (Azure AI Foundry — Assistants API with persistent threads) ──
-  // Static instructions live on the agent; only live document context is sent per-run.
   if (assistantsClient && AZURE_AGENT_ID) {
     try {
-      // Create a new thread on first message; reuse for subsequent turns in the same session
       if (!threadId) {
         const thread = await assistantsClient.beta.threads.create();
         threadId = thread.id;
       }
 
-      // Add the user message to the thread
       await assistantsClient.beta.threads.messages.create(threadId, {
         role: "user",
         content: message
       });
 
-      // Inject live document state via additional_instructions (not stored in thread history)
       const docContext = buildDocumentContext(contentControls, docText, null);
 
       logger.debug("AGENT_REQ", {
@@ -504,7 +1009,6 @@ app.post("/api/chat", async (req, res) => {
         throw new Error(`Agent run ended with status: ${run.status}. ${run.last_error?.message || ""}`);
       }
 
-      // Get the latest assistant message
       const msgList  = await assistantsClient.beta.threads.messages.list(threadId, { limit: 1, order: "desc" });
       const latestMsg = msgList.data[0];
       const rawReply  = latestMsg?.content
@@ -553,7 +1057,62 @@ app.post("/api/chat", async (req, res) => {
     }
   }
 
-  // ── AI path (Azure OpenAI) ──────────────────────────────────────────────
+  // ── Chat Completions + Tool Calling ─────────────────────────────────────
+  const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
+  if (aiClient && hasTools) {
+    try {
+      const systemPrompt = buildSystemPrompt(contentControls, docText, null);
+
+      logger.debug("TOOL_CHAT_REQ", {
+        message: `Tool-calling request [${reqId}]`,
+        reqId,
+        deployment: AZURE_DEPLOYMENT,
+        toolCount: DOCUMENT_TOOLS.length + mcpToolDefs.length,
+        userMessage: message,
+        threadId
+      });
+
+      const { reply, actions, usage } = await chatWithTools(
+        systemPrompt, message, contentControls
+      );
+
+      logger.info("TOOL_CHAT_RES", {
+        message: `Tool-calling response [${reqId}]`,
+        reqId,
+        replyLength: reply.length,
+        actions: actions.map(a => a.type),
+        promptTokens: usage?.prompt_tokens,
+        completionTokens: usage?.completion_tokens,
+      });
+
+      // Build response for client
+      const response = { reply, threadId };
+
+      for (const action of actions) {
+        if (action.type === "navigate") {
+          response.navigateTo       = action.tag;
+          response.contentControlId = action.contentControlId;
+        }
+        if (action.type === "update") {
+          response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+        }
+        if (action.type === "insert") {
+          response.insertAction = { tag: action.tag, text: action.text };
+        }
+        if (action.type === "delete") {
+          response.deleteAction = { tag: action.tag, contentControlId: action.contentControlId };
+        }
+      }
+
+      return res.json(response);
+
+    } catch (err) {
+      logger.error("TOOL_CHAT_ERR", { message: `Tool-calling error [${reqId}]`, reqId, error: err.message });
+      // Fall through to simple prompt agent
+    }
+  }
+
+  // ── Prompt Agent fallback (Chat Completions API) ────────────────────────
   if (aiClient) {
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
@@ -563,7 +1122,6 @@ app.post("/api/chat", async (req, res) => {
         reqId,
         deployment: AZURE_DEPLOYMENT,
         systemPromptLength: systemPrompt.length,
-        systemPrompt,
         userMessage: message
       });
 
@@ -589,11 +1147,10 @@ app.post("/api/chat", async (req, res) => {
         rawReply
       });
 
-      // Strip action JSON from visible reply, parse it for navigation/update
       const action      = parseActionFromReply(rawReply);
       const cleanReply  = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
 
-      const response = { reply: cleanReply };
+      const response = { reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -609,14 +1166,6 @@ app.post("/api/chat", async (req, res) => {
         response.insertAction = { tag: action.tag, text: action.text };
       }
 
-      logger.info("CHAT_RES", {
-        message: `Chat response [${reqId}]`,
-        reqId,
-        replyLength: cleanReply.length,
-        action: action?.action || null,
-        navigateTo: response.navigateTo || null
-      });
-
       return res.json(response);
 
     } catch (err) {
@@ -629,7 +1178,7 @@ app.post("/api/chat", async (req, res) => {
   const msg = message.toLowerCase();
 
   if (msg.includes("list") || msg.includes("all clause") || msg.includes("show clause") || msg.includes("what clause")) {
-    return res.json({ reply: formatClauseList(contentControls) });
+    return res.json({ reply: formatClauseList(contentControls), threadId });
   }
 
   const findMatch =
@@ -643,33 +1192,35 @@ app.post("/api/chat", async (req, res) => {
       return res.json({
         reply: `Found **${found.tag || found.title}** (ID: ${found.id}).\n\n"${(found.text || "").substring(0, 200)}…"`,
         contentControlId: found.id,
-        navigateTo: found.tag || found.title
+        navigateTo: found.tag || found.title,
+        threadId
       });
     }
-    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.` });
+    return res.json({ reply: `Could not find "${keyword}". Try "List all clauses" to see what's available.`, threadId });
   }
 
   const updateMatch = msg.match(/(?:change|update|replace|set)\s+(.+?)\s+(?:from\s+)?["']?(.+?)["']?\s+to\s+["']?(.+?)["']?$/);
   if (updateMatch) {
     return res.json({
       reply: `Updating "${updateMatch[2]}" → "${updateMatch[3]}". Click Apply below.`,
-      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] }
+      updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] },
+      threadId
     });
   }
 
   res.json({
-    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`
+    reply: `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"\n• "Change 30 days to 60 days"`,
+    threadId
   });
 });
 
-// ── POST /api/parse-xml-metadata ─────────────────────────────────────────────
+// ── POST /api/parse-xml-metadata ──────────────────────────────────────────────
 // Accepts raw custom XML strings from Office.js customXmlParts and returns a
 // map of { [ccId]: clauseName } by decoding the Conga GZIP-compressed metadata.
-// Used by the Word add-in to get human-readable clause names (the <Tag> field).
 
 app.post("/api/parse-xml-metadata", (req, res) => {
   const { xmlStrings = [] } = req.body;
-  const tagMap = {}; // { [ccId]: clauseName }
+  const tagMap = {};
 
   for (const xml of xmlStrings) {
     if (typeof xml !== "string") continue;
@@ -688,17 +1239,15 @@ app.post("/api/parse-xml-metadata", (req, res) => {
         const buf = Buffer.from(encoded, "base64");
         metaXml = zlib.gunzipSync(buf).toString("utf8");
       } catch {
-        metaXml = encoded; // fallback: may already be plain XML
+        metaXml = encoded;
       }
       if (!metaXml) continue;
 
-      // Extract <Tag> from the decompressed metadata XML
       const tagMatch = metaXml.match(/<Tag>([^<]*)<\/Tag>/);
       if (!tagMatch) continue;
       const clauseName = tagMatch[1].trim();
       if (!clauseName) continue;
 
-      // Register by raw id and unsigned-32 equivalent (Word can return signed ints)
       const register = (key) => { if (key) tagMap[key] = clauseName; };
       register(ccIdRaw);
       const asNum = parseInt(ccIdRaw, 10);
@@ -712,38 +1261,29 @@ app.post("/api/parse-xml-metadata", (req, res) => {
   res.json({ tagMap });
 });
 
-// ── POST /api/risk-scan ───────────────────────────────────────────────────────
+// ── POST /api/risk-scan ──────────────────────────────────────────────────────
 // Analyses every clause in the document and returns a risk score for each one.
-// Response: { clauses: [{ tag, id, riskLevel: "low"|"medium"|"high", reason, riskFactors }] }
 
 app.post("/api/risk-scan", async (req, res) => {
   const { contentControls = [] } = req.body;
   const reqId = Date.now().toString(36);
 
-  // Scan clauses — skip pure data fields (Field, Repeat, Segment) which have no prose text
   const SKIP_TYPES = new Set(["field", "repeat", "segment"]);
   const clauses = contentControls.filter(
     (cc) => !SKIP_TYPES.has((cc.type || "").toLowerCase()) && (cc.tag || cc.title)
   );
 
-  if (!clauses.length) {
-    return res.json({ clauses: [] });
-  }
+  if (!clauses.length) return res.json({ clauses: [] });
 
   if (!aiClient && !assistantsClient) {
-    // No AI — return unknown risk for all clauses
     return res.json({
       clauses: clauses.map((cc) => ({
-        tag: cc.tag || cc.title,
-        id: cc.id,
-        riskLevel: "unknown",
-        reason: "AI not configured",
-        riskFactors: []
+        tag: cc.tag || cc.title, id: cc.id, riskLevel: "unknown",
+        reason: "AI not configured", riskFactors: []
       }))
     });
   }
 
-  // Build a compact clause list for the prompt (tag + first 400 chars of text)
   const clauseList = clauses.map((cc, i) =>
     `[${i + 1}] Tag: "${cc.tag || cc.title}" (ID: ${cc.id})\nText: ${cc.text || "(empty)"}`
   ).join("\n\n");
@@ -755,14 +1295,14 @@ Each element must have exactly these fields:
   "id"          — the ID value from the input (number)
   "riskLevel"   — one of: "high", "medium", "low"
   "reason"      — one concise sentence explaining the risk rating (max 12 words)
-  "riskFactors" — array of up to 3 short risk factor labels (e.g. "Uncapped liability", "Auto-renewal trap")
+  "riskFactors" — array of up to 3 short risk factor labels
 
 Risk guidelines:
-  HIGH   — uncapped liability, unilateral termination without cause, broad IP assignment, indemnification without limits, auto-renewal with <30 day opt-out window, jurisdiction heavily favoring counterparty
-  MEDIUM — payment terms >60 days, liquidated damages, exclusivity clauses, non-compete >1 year, limited warranties, one-sided amendment rights
-  LOW    — standard confidentiality, reasonable notice periods, mutual obligations, balanced termination, industry-standard governing law
+  HIGH   — uncapped liability, unilateral termination without cause, broad IP assignment, indemnification without limits, auto-renewal with <30 day opt-out window
+  MEDIUM — payment terms >60 days, liquidated damages, exclusivity clauses, non-compete >1 year, limited warranties
+  LOW    — standard confidentiality, reasonable notice periods, mutual obligations, balanced termination
 
-Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel":"high","reason":"Net-90 payment terms heavily favour the buyer.","riskFactors":["Long payment window","Cash flow risk"]}]`;
+Return ONLY the JSON array.`;
 
   try {
     const completion = await aiClient.chat.completions.create({
@@ -776,8 +1316,6 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
     });
 
     let raw = completion.choices[0]?.message?.content || "[]";
-
-    // Extract JSON array — strip any markdown code fences first
     raw = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
     let parsed;
     try {
@@ -793,8 +1331,6 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
 
   } catch (err) {
     logger.error("RISK_SCAN_ERR", { message: `Risk scan error [${reqId}]`, reqId, error: err.message });
-
-    // json_object format may not be supported on all deployments — retry without it
     try {
       const completion = await aiClient.chat.completions.create({
         model: AZURE_DEPLOYMENT,
@@ -818,9 +1354,6 @@ Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel
 
 // ── POST /api/chat/stream ─────────────────────────────────────────────────────
 // Streaming version of /api/chat — uses Server-Sent Events (SSE).
-// Tokens are emitted as {"type":"token","text":"..."} and the final event is
-// {"type":"done","reply":"...","threadId":"...","action":{...}} (action is optional).
-// The frontend reads the stream with fetch + ReadableStream and renders tokens live.
 
 app.post("/api/chat/stream", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
@@ -897,7 +1430,6 @@ app.post("/api/chat/stream", async (req, res) => {
 
     } catch (err) {
       logger.error("AGENT_STREAM_FAIL", { message: `Agent stream failed [${reqId}], falling back`, reqId, error: err.message });
-      // Fall through to chat.completions
     }
   }
 
@@ -928,7 +1460,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
       const action     = parseActionFromReply(fullText);
       const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-      const done = { type: "done", reply: cleanReply };
+      const done = { type: "done", reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
         const found = findClause(action.tag, contentControls);
@@ -954,13 +1486,13 @@ app.post("/api/chat/stream", async (req, res) => {
     }
   }
 
-  // ── Keyword fallback (no AI) ───────────────────────────────────────────────
+  // ── Keyword fallback (no AI) ──────────────────────────────────────────────
   const msg_lc = message.toLowerCase();
   let fallbackReply = `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"`;
   if (msg_lc.includes("list") || msg_lc.includes("all clause") || msg_lc.includes("show clause")) {
     fallbackReply = formatClauseList(contentControls);
   }
-  sendEvent({ type: "done", reply: fallbackReply });
+  sendEvent({ type: "done", reply: fallbackReply, threadId });
   endStream();
 });
 
@@ -1043,6 +1575,66 @@ app.post("/api/metadata", upload.single("file"), (req, res) => {
   }
 });
 
+// ── POST /api/end-review ──────────────────────────────────────────────────────
+// Directly calls the Conga End Review MCP tool using env-configured IDs.
+// No AI involved — just calls the tool and returns the result.
+
+app.post("/api/end-review", async (req, res) => {
+  const reviewtype = "Office365";
+  const reviewid   = process.env.CONGA_REVIEW_ID   || "";
+  const reviewerid = process.env.CONGA_REVIEWER_ID  || "";
+  const reqId = Date.now().toString(36);
+
+  if (!reviewid || !reviewerid) {
+    return res.status(400).json({ success: false, error: "CONGA_REVIEW_ID and CONGA_REVIEWER_ID must be set in api/.env" });
+  }
+
+  try {
+    // Step 1: Get ExternalToken
+    logger.info("END_REVIEW", { message: `Getting ExternalToken for reviewtype=${reviewtype}`, reqId });
+    const externalToken = await getReviewExternalToken(reviewtype);
+
+    // Step 2: Call endReviewerReview with auth + external token
+    const token = await getCongaToken();
+    const args = {
+      reviewtype,
+      reviewid,
+      reviewerid,
+      ExternalToken: externalToken || "",
+      Authorization: `Bearer ${token}`,
+    };
+
+    logger.info("END_REVIEW", { message: `Calling endReviewerReview: reviewid=${reviewid}, reviewerid=${reviewerid}`, reqId });
+    const mcpResult = await callFoundryToolbox("tools/call", {
+      name: "congaendreviewtool___endReviewerReview",
+      arguments: args,
+    });
+
+    logger.info("END_REVIEW", { message: "endReviewerReview completed", reqId, result: JSON.stringify(mcpResult).substring(0, 500) });
+
+    // Check JSON-RPC level error
+    if (mcpResult.error) {
+      const errMsg = mcpResult.error.message || JSON.stringify(mcpResult.error);
+      logger.error("END_REVIEW_ERR", { message: `MCP JSON-RPC error [${reqId}]`, reqId, error: errMsg });
+      return res.status(500).json({ success: false, error: errMsg });
+    }
+
+    // Check MCP tool-level error (isError: true in result)
+    const toolResult = mcpResult.result ?? mcpResult;
+    if (toolResult.isError) {
+      const errText = toolResult.content?.map(c => c.text).join(" ") || "Tool returned an error.";
+      logger.error("END_REVIEW_ERR", { message: `MCP tool error [${reqId}]`, reqId, error: errText });
+      return res.status(500).json({ success: false, error: errText });
+    }
+
+    return res.json({ success: true, message: "Review ended successfully.", result: mcpResult });
+
+  } catch (err) {
+    logger.error("END_REVIEW_ERR", { message: `End review failed [${reqId}]`, reqId, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── POST /api/suggest-fix ─────────────────────────────────────────────────────
 // Given a single risky clause, returns a rewritten version that mitigates the risk.
 // Request:  { tag, id, text, riskLevel, reason, riskFactors }
@@ -1107,7 +1699,7 @@ app.get("/api/health", (_req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   logger.info("STARTUP", { message: `Conga AI Assistance API started on port ${PORT}`, port: PORT, aiEnabled: !!aiClient, deployment: AZURE_DEPLOYMENT });
-  console.log(`\nConga AI Assistance  →  http://localhost:${PORT}`);
+  console.log(`\nConga AI Assistance API  →  http://localhost:${PORT}`);
   console.log(`Health check         →  http://localhost:${PORT}/api/health`);
   console.log(`Logs                 →  ${LOGS_DIR}\n`);
 });
