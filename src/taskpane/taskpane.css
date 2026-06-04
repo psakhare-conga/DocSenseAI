@@ -727,6 +727,16 @@ body {
 .risk-item-medium { border-left: 3px solid #f59e0b; }
 .risk-item-low    { border-left: 3px solid #22c55e; }
 
+/* Fixed state — clause has had a suggestion applied */
+.risk-item-fixed {
+  opacity: 0.55;
+  border-left-color: #22c55e !important;
+}
+.risk-item-fixed .risk-badge {
+  background: #d1fae5 !important;
+  color: #065f46 !important;
+}
+
 .risk-item-top {
   display: flex;
   align-items: center;
@@ -798,5 +808,183 @@ body {
 .risk-scan-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Suggest Fix button ──────────────────────────────────────────────────── */
+.suggest-fix-btn {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 8px;
+  border: 1px solid #818cf8;
+  background: #eef2ff;
+  color: #3730a3;
+  cursor: pointer;
+  font-family: inherit;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background 0.1s, border-color 0.1s;
+}
+.suggest-fix-btn:hover {
+  background: #e0e7ff;
+  border-color: #6366f1;
+}
+
+/* ── Suggestion panel ────────────────────────────────────────────────────── */
+.suggestion-panel {
+  margin-top: 8px;
+  border-radius: 6px;
+  border: 1px solid #c7d2fe;
+  background: #f5f7ff;
+  padding: 8px 10px;
+}
+
+.suggestion-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #605e5c;
+}
+
+.suggestion-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #3730a3;
+  margin-bottom: 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.suggestion-text {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #1e1e1e;
+  background: #fff;
+  border: 1px solid #c7d2fe;
+  border-radius: 4px;
+  padding: 7px 9px;
+  white-space: pre-wrap;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.suggestion-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.suggestion-apply-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 6px;
+  border: 1px solid #16a34a;
+  background: #f0fdf4;
+  color: #15803d;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s;
+}
+.suggestion-apply-btn:hover {
+  background: #dcfce7;
+}
+
+.suggestion-dismiss-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #6b7280;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s;
+}
+.suggestion-dismiss-btn:hover {
+  background: #f3f4f6;
+}
+
+.suggestion-error {
+  font-size: 11px;
+  color: #b91c1c;
+}
+
+/* ── Pending edit (redline confirmation) ─────────────────────────────────── */
+.pending-edit {
+  margin-top: 6px;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  background: #fffbeb;
+  padding: 8px 10px;
+}
+
+.pending-edit-diff {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.pending-edit-old {
+  text-decoration: line-through;
+  color: #b91c1c;
+  background: #fee2e2;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: monospace;
+}
+
+.pending-edit-arrow {
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.pending-edit-new {
+  color: #15803d;
+  background: #dcfce7;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  font-family: monospace;
+}
+
+.pending-edit-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.pending-confirm-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 6px;
+  border: 1px solid #16a34a;
+  background: #f0fdf4;
+  color: #15803d;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s;
+}
+.pending-confirm-btn:hover {
+  background: #dcfce7;
+}
+
+.pending-cancel-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #6b7280;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s;
+}
+.pending-cancel-btn:hover {
+  background: #f3f4f6;
 }
 

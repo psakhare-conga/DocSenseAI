@@ -1043,6 +1043,59 @@ app.post("/api/metadata", upload.single("file"), (req, res) => {
   }
 });
 
+// ── POST /api/suggest-fix ─────────────────────────────────────────────────────
+// Given a single risky clause, returns a rewritten version that mitigates the risk.
+// Request:  { tag, id, text, riskLevel, reason, riskFactors }
+// Response: { suggestedText }
+
+app.post("/api/suggest-fix", async (req, res) => {
+  const { tag, id, text, riskLevel, reason, riskFactors = [] } = req.body;
+
+  if (!text) return res.status(400).json({ error: "Clause text is required" });
+  if (!aiClient) return res.status(503).json({ error: "AI not configured" });
+
+  const reqId = Date.now().toString(36);
+
+  const systemPrompt = `You are a contract lawyer specialising in risk mitigation. Your job is to rewrite a single contract clause to reduce its legal and commercial risk while preserving its intent.
+
+Rules:
+- Return ONLY the rewritten clause text — no explanations, no preamble, no markdown
+- Keep the same general structure and length as the original
+- Fix the specific issues identified in the risk assessment
+- Use balanced, professional contract language
+- Do not add headings or labels`;
+
+  const userPrompt = `Rewrite the following clause to reduce its risk.
+
+Clause name: "${tag}"
+Risk level: ${riskLevel}
+Risk reason: ${reason}
+Risk factors: ${riskFactors.join(", ")}
+
+Original clause text:
+${text}`;
+
+  try {
+    const completion = await aiClient.chat.completions.create({
+      model: AZURE_DEPLOYMENT,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userPrompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 1000
+    });
+
+    const suggestedText = (completion.choices[0]?.message?.content || "").trim();
+    logger.info("SUGGEST_FIX", { message: `Suggest fix [${reqId}] for clause id:${id}`, reqId });
+    return res.json({ suggestedText });
+
+  } catch (err) {
+    logger.error("SUGGEST_FIX_ERR", { message: `Suggest fix error [${reqId}]`, reqId, error: err.message });
+    return res.status(500).json({ error: "Failed to generate suggestion: " + err.message });
+  }
+});
+
 // ── GET /api/health ───────────────────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) => {
