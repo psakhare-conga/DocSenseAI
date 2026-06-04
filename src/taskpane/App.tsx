@@ -30,6 +30,7 @@ interface ContentControl {
   markedForDeletion?: string; // "true" = pending removal
   action?: string;         // "Inserted" | "Deleted" | "Replaced"
   clauseMarkup?: string;   // clause OOXML markup
+  clauseName?: string;     // human-readable name from Conga custom XML <Tag> field
 }
 
 interface Message {
@@ -48,6 +49,14 @@ interface UpdateAction {
 interface InsertAction {
   tag: string;   // clause name/tag for the new clause
   text: string;  // full text of the new clause
+}
+
+interface RiskResult {
+  tag: string;
+  id: number;
+  riskLevel: "high" | "medium" | "low" | "unknown";
+  reason: string;
+  riskFactors: string[];
 }
 
 // ─── Component ──────────────────────────────────────────────────────────────
@@ -69,9 +78,14 @@ export default function App() {
   const [showClauses, setShowClauses] = useState(false);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [riskResults, setRiskResults] = useState<RiskResult[] | null>(null);
+  const [riskLoading, setRiskLoading] = useState(false);
+  const [showRiskPanel, setShowRiskPanel] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Conga custom XML tag map: { [ccId]: clauseName } — persists across refreshes
+  const tagMapRef = useRef<Record<string, string>>({});
 
   // ── Initialise Office.js ──────────────────────────────────────────────────
 
@@ -100,6 +114,7 @@ export default function App() {
         await context.sync();
 
         const CONGA_TYPES = new Set(["clause", "field", "repeat", "segment"]);
+        const tagMap = tagMapRef.current;
         const loaded: ContentControl[] = ccs.items
           .filter((cc) => cc.tag || CONGA_TYPES.has((cc.title || "").toLowerCase()))
           .map((cc) => ({
@@ -112,7 +127,8 @@ export default function App() {
             type: cc.title || "",
             cannotEdit: cc.cannotEdit || false,
             cannotDelete: cc.cannotDelete || false,
-            placeholderText: cc.placeholderText || ""
+            placeholderText: cc.placeholderText || "",
+            clauseName: tagMap[cc.id.toString()] || tagMap[String(cc.id >>> 0)] || undefined
           }));
         setContentControls(loaded);
       });
@@ -121,22 +137,28 @@ export default function App() {
 
   const loadDocumentMetadata = async () => {
     setThreadId(null); // new document load = fresh conversation session
+    let loaded: ContentControl[] = [];
+    let xmlStrings: string[] = [];
+    let clauseCount = 0, fieldCount = 0;
+
     try {
       await Word.run(async (context) => {
         const ccs = context.document.contentControls;
         // Load richer properties matching XAuthor's ContentControlInfo model
         ccs.load("items/id,items/tag,items/title,items/text,items/cannotEdit,items/cannotDelete,items/placeholderText");
+        const parts = context.document.customXmlParts;
+        parts.load("items/id"); // prime the collection
         await context.sync();
 
         const CONGA_TYPES = new Set(["clause", "field", "repeat", "segment"]);
 
-        const loaded: ContentControl[] = ccs.items
+        loaded = ccs.items
           // Keep only Conga-tagged controls or those with a recognised Conga title
           .filter((cc) => cc.tag || CONGA_TYPES.has((cc.title || "").toLowerCase()))
           .map((cc) => ({
             id: cc.id,
-            // cc.tag   = w:tag  — the clause/field name (e.g. "Payment Terms")
-            // cc.title = w:alias — the Conga type  (e.g. "Clause", "Field", "Repeat")
+            // cc.tag   = w:tag  — numeric record ID in Conga CLM docs
+            // cc.title = w:alias — the Conga type (e.g. "Clause", "Field", "Repeat")
             tag: cc.tag || "",
             title: cc.tag
               ? `${cc.tag}${cc.title ? " (" + cc.title + ")" : ""}`
@@ -148,20 +170,44 @@ export default function App() {
             placeholderText: cc.placeholderText || ""
           }));
 
-        setContentControls(loaded);
+        clauseCount = loaded.filter((cc) => (cc.type || "").toLowerCase() === "clause").length;
+        fieldCount  = loaded.filter((cc) => (cc.type || "").toLowerCase() === "field").length;
 
-        const clauses = loaded.filter((cc) => (cc.type || "").toLowerCase() === "clause");
-        const fields  = loaded.filter((cc) => (cc.type || "").toLowerCase() === "field");
-
-        addSystemMessage(
-          loaded.length > 0
-            ? `Document loaded — found ${clauses.length} clause${clauses.length !== 1 ? "s" : ""} and ${fields.length} field${fields.length !== 1 ? "s" : ""}.`
-            : "Document loaded — no Conga content controls found. Open a Conga contract document."
-        );
+        // Read raw custom XML parts — Conga stores GZIP-compressed metadata here
+        const xmlResults = parts.items.map((p) => p.getXml());
+        await context.sync();
+        xmlStrings = xmlResults.map((r) => r.value).filter(Boolean);
       });
     } catch {
       addSystemMessage("Could not read document. Make sure a Word document is open.");
+      return;
     }
+
+    // Enrich content controls with human-readable clause names from Conga metadata
+    if (xmlStrings.length) {
+      try {
+        const resp = await fetch(`${API_URL}/api/parse-xml-metadata`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ xmlStrings })
+        });
+        if (resp.ok) {
+          const { tagMap = {} } = await resp.json();
+          tagMapRef.current = tagMap; // persist for use in refreshContentControls
+          loaded = loaded.map((cc) => ({
+            ...cc,
+            clauseName: tagMap[cc.id.toString()] || tagMap[String(cc.id >>> 0)] || undefined
+          }));
+        }
+      } catch { /* non-fatal — display falls back to text snippet */ }
+    }
+
+    setContentControls(loaded);
+    addSystemMessage(
+      loaded.length > 0
+        ? `Document loaded — found ${clauseCount} clause${clauseCount !== 1 ? "s" : ""} and ${fieldCount} field${fieldCount !== 1 ? "s" : ""}.`
+        : "Document loaded — no Conga content controls found. Open a Conga contract document."
+    );
   };
 
   // ── Navigate Word to a specific content control ──────────────────────────
@@ -244,6 +290,33 @@ export default function App() {
       });
     } catch (err) {
       addSystemMessage(`Failed to update clause: ${err}`);
+    }
+  };
+
+  // ── Clause risk scan ──────────────────────────────────────────────────────
+
+  const scanRisk = async () => {
+    if (riskLoading || !contentControls.length) return;
+    setRiskLoading(true);
+    setShowRiskPanel(true);
+    setRiskResults(null);
+    try {
+      const response = await fetch(`${API_URL}/api/risk-scan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contentControls })
+      });
+      if (!response.ok) throw new Error(`API ${response.status}`);
+      const data = await response.json();
+      // The AI may return {clauses:[...]}, {results:[...]}, or a bare array
+      const raw = data.clauses ?? data.results ?? data;
+      const arr: RiskResult[] = Array.isArray(raw) ? raw : Object.values(raw).find(v => Array.isArray(v)) as RiskResult[] ?? [];
+      setRiskResults(arr);
+    } catch {
+      setRiskResults([]);
+      addSystemMessage("Risk scan failed. Make sure the API server is running.");
+    } finally {
+      setRiskLoading(false);
     }
   };
 
@@ -456,6 +529,84 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Risk Panel ── */}
+      {showRiskPanel && (
+        <div className="risk-panel">
+          <div className="risk-panel-header">
+            <span>⚠️ Clause Risk Scan</span>
+            <div className="risk-panel-header-right">
+              {riskResults && Array.isArray(riskResults) && !riskLoading && (
+                <span className="risk-summary">
+                  {["high","medium","low"].map(level => {
+                    const count = riskResults.filter(r => r.riskLevel === level).length;
+                    return count > 0 ? (
+                      <span key={level} className={`risk-count risk-count-${level}`}>
+                        {level === "high" ? "🔴" : level === "medium" ? "🟡" : "🟢"} {count}
+                      </span>
+                    ) : null;
+                  })}
+                </span>
+              )}
+              <button className="risk-panel-close" onClick={() => setShowRiskPanel(false)}>✕</button>
+            </div>
+          </div>
+
+          {riskLoading && (
+            <div className="risk-loading">
+              <div className="risk-loading-dots"><span /><span /><span /></div>
+              <span>Analysing clauses…</span>
+            </div>
+          )}
+
+          {!riskLoading && riskResults && Array.isArray(riskResults) && riskResults.length === 0 && (
+            <div className="risk-empty">No clauses found to analyse.</div>
+          )}
+
+          {!riskLoading && riskResults && Array.isArray(riskResults) && riskResults.length > 0 && (
+            <div className="risk-list">
+              {["high", "medium", "low"].map(level =>
+                riskResults
+                  .filter(r => r.riskLevel === level)
+                  .map(r => {
+                    const cc = contentControls.find(c => c.id === r.id);
+                    // Priority: Conga metadata Tag > placeholderText > text snippet > raw tag
+                    const isNumericTag = /^\d+$/.test(cc?.tag || "");
+                    const displayName =
+                      cc?.clauseName
+                      || (cc?.placeholderText && cc.placeholderText.trim())
+                      || (!isNumericTag && cc?.tag)
+                      || (cc?.text ? cc.text.trim().split(/\s+/).slice(0, 5).join(" ") + "…" : null)
+                      || r.tag;
+                    return (
+                    <div
+                      key={r.id}
+                      className={`risk-item risk-item-${r.riskLevel}`}
+                      onClick={() => navigateToClause(r.id)}
+                      title="Click to navigate to this clause"
+                    >
+                      <div className="risk-item-top">
+                        <span className="risk-badge risk-badge-${r.riskLevel}">
+                          {r.riskLevel === "high" ? "🔴 High" : r.riskLevel === "medium" ? "🟡 Medium" : "🟢 Low"}
+                        </span>
+                        <span className="risk-tag">{displayName}</span>
+                      </div>
+                      <div className="risk-reason">{r.reason}</div>
+                      {r.riskFactors && r.riskFactors.length > 0 && (
+                        <div className="risk-factors">
+                          {r.riskFactors.map((f, i) => (
+                            <span key={i} className="risk-factor-chip">{f}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── Messages ── */}
       <div className="messages">
         {messages.map((msg) => (
@@ -495,6 +646,14 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
+        <button
+          className={`risk-scan-btn${riskLoading ? " risk-scan-btn-loading" : ""}`}
+          onClick={scanRisk}
+          disabled={riskLoading || !contentControls.length}
+          title="Scan all clauses for risk"
+        >
+          {riskLoading ? "⏳ Scanning…" : "⚠️ Risk Scan"}
+        </button>
         <button onClick={() => quickAction("List all clauses in this document")}>
           List Clauses
         </button>

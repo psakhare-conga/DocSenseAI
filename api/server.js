@@ -662,6 +662,160 @@ app.post("/api/chat", async (req, res) => {
   });
 });
 
+// ── POST /api/parse-xml-metadata ─────────────────────────────────────────────
+// Accepts raw custom XML strings from Office.js customXmlParts and returns a
+// map of { [ccId]: clauseName } by decoding the Conga GZIP-compressed metadata.
+// Used by the Word add-in to get human-readable clause names (the <Tag> field).
+
+app.post("/api/parse-xml-metadata", (req, res) => {
+  const { xmlStrings = [] } = req.body;
+  const tagMap = {}; // { [ccId]: clauseName }
+
+  for (const xml of xmlStrings) {
+    if (typeof xml !== "string") continue;
+    const CONGA_NS = "http://www.apttus.com/schemas";
+    if (!xml.includes(CONGA_NS)) continue;
+
+    const nodeRegex = /<Node\b[^>]*\bp2:id="([^"]+)"[^>]*>([\s\S]*?)<\/Node>/g;
+    let nodeMatch;
+    while ((nodeMatch = nodeRegex.exec(xml)) !== null) {
+      const ccIdRaw = nodeMatch[1].trim();
+      const encoded = nodeMatch[2].trim();
+      if (!encoded) continue;
+
+      let metaXml = null;
+      try {
+        const buf = Buffer.from(encoded, "base64");
+        metaXml = zlib.gunzipSync(buf).toString("utf8");
+      } catch {
+        metaXml = encoded; // fallback: may already be plain XML
+      }
+      if (!metaXml) continue;
+
+      // Extract <Tag> from the decompressed metadata XML
+      const tagMatch = metaXml.match(/<Tag>([^<]*)<\/Tag>/);
+      if (!tagMatch) continue;
+      const clauseName = tagMatch[1].trim();
+      if (!clauseName) continue;
+
+      // Register by raw id and unsigned-32 equivalent (Word can return signed ints)
+      const register = (key) => { if (key) tagMap[key] = clauseName; };
+      register(ccIdRaw);
+      const asNum = parseInt(ccIdRaw, 10);
+      if (!isNaN(asNum)) {
+        register((asNum >>> 0).toString());
+        register(asNum.toString());
+      }
+    }
+  }
+
+  res.json({ tagMap });
+});
+
+// ── POST /api/risk-scan ───────────────────────────────────────────────────────
+// Analyses every clause in the document and returns a risk score for each one.
+// Response: { clauses: [{ tag, id, riskLevel: "low"|"medium"|"high", reason, riskFactors }] }
+
+app.post("/api/risk-scan", async (req, res) => {
+  const { contentControls = [] } = req.body;
+  const reqId = Date.now().toString(36);
+
+  // Scan clauses — skip pure data fields (Field, Repeat, Segment) which have no prose text
+  const SKIP_TYPES = new Set(["field", "repeat", "segment"]);
+  const clauses = contentControls.filter(
+    (cc) => !SKIP_TYPES.has((cc.type || "").toLowerCase()) && (cc.tag || cc.title)
+  );
+
+  if (!clauses.length) {
+    return res.json({ clauses: [] });
+  }
+
+  if (!aiClient && !assistantsClient) {
+    // No AI — return unknown risk for all clauses
+    return res.json({
+      clauses: clauses.map((cc) => ({
+        tag: cc.tag || cc.title,
+        id: cc.id,
+        riskLevel: "unknown",
+        reason: "AI not configured",
+        riskFactors: []
+      }))
+    });
+  }
+
+  // Build a compact clause list for the prompt (tag + first 400 chars of text)
+  const clauseList = clauses.map((cc, i) =>
+    `[${i + 1}] Tag: "${cc.tag || cc.title}" (ID: ${cc.id})\nText: ${cc.text || "(empty)"}`
+  ).join("\n\n");
+
+  const systemPrompt = `You are a contract risk analyst. Analyse each clause below and return ONLY a valid JSON array — no prose, no markdown, no code fences.
+
+Each element must have exactly these fields:
+  "tag"         — the Tag value from the input (string)
+  "id"          — the ID value from the input (number)
+  "riskLevel"   — one of: "high", "medium", "low"
+  "reason"      — one concise sentence explaining the risk rating (max 12 words)
+  "riskFactors" — array of up to 3 short risk factor labels (e.g. "Uncapped liability", "Auto-renewal trap")
+
+Risk guidelines:
+  HIGH   — uncapped liability, unilateral termination without cause, broad IP assignment, indemnification without limits, auto-renewal with <30 day opt-out window, jurisdiction heavily favoring counterparty
+  MEDIUM — payment terms >60 days, liquidated damages, exclusivity clauses, non-compete >1 year, limited warranties, one-sided amendment rights
+  LOW    — standard confidentiality, reasonable notice periods, mutual obligations, balanced termination, industry-standard governing law
+
+Return ONLY the JSON array. Example: [{"tag":"Payment Terms","id":123,"riskLevel":"high","reason":"Net-90 payment terms heavily favour the buyer.","riskFactors":["Long payment window","Cash flow risk"]}]`;
+
+  try {
+    const completion = await aiClient.chat.completions.create({
+      model: AZURE_DEPLOYMENT,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: clauseList }
+      ],
+      temperature: 0.1,
+      max_tokens: 2000
+    });
+
+    let raw = completion.choices[0]?.message?.content || "[]";
+
+    // Extract JSON array — strip any markdown code fences first
+    raw = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+    let parsed;
+    try {
+      const obj = JSON.parse(raw);
+      parsed = Array.isArray(obj) ? obj : (obj.clauses || obj.results || Object.values(obj).find(v => Array.isArray(v)) || []);
+    } catch {
+      const match = raw.match(/\[[\s\S]*\]/);
+      parsed = match ? JSON.parse(match[0]) : [];
+    }
+
+    logger.info("RISK_SCAN", { message: `Risk scan [${reqId}] — ${parsed.length} clauses scored`, reqId });
+    return res.json({ clauses: parsed });
+
+  } catch (err) {
+    logger.error("RISK_SCAN_ERR", { message: `Risk scan error [${reqId}]`, reqId, error: err.message });
+
+    // json_object format may not be supported on all deployments — retry without it
+    try {
+      const completion = await aiClient.chat.completions.create({
+        model: AZURE_DEPLOYMENT,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: clauseList }
+        ],
+        temperature: 0.1,
+        max_tokens: 2000
+      });
+      let raw = completion.choices[0]?.message?.content || "[]";
+      const match = raw.match(/\[[\s\S]*\]/);
+      const parsed = match ? JSON.parse(match[0]) : [];
+      return res.json({ clauses: parsed });
+    } catch (err2) {
+      logger.error("RISK_SCAN_ERR2", { message: `Risk scan retry failed [${reqId}]`, reqId, error: err2.message });
+      return res.status(500).json({ error: "Risk scan failed", clauses: [] });
+    }
+  }
+});
+
 // ── POST /api/chat/stream ─────────────────────────────────────────────────────
 // Streaming version of /api/chat — uses Server-Sent Events (SSE).
 // Tokens are emitted as {"type":"token","text":"..."} and the final event is
