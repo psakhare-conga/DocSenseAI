@@ -134,12 +134,11 @@ if (FOUNDRY_TOOLBOX_URL) {
   console.log(`Foundry Toolbox MCP → ${FOUNDRY_TOOLBOX_URL.split("?")[0]}...`);
 }
 
-// ── Conga token provider (auto-auth for congaapitools) ─────────────────────
+// ── Conga token provider (auto-auth for review tools) ─────────────────────
 const CONGA_CLIENT_ID     = process.env.CONGA_CLIENT_ID || "";
 const CONGA_CLIENT_SECRET = process.env.CONGA_CLIENT_SECRET || "";
 const CONGA_SCOPE         = process.env.CONGA_SCOPE || "sign";
 const CONGA_AUTH_URL      = process.env.CONGA_AUTH_URL || "https://login-rlsdev.congacloud.io/api/v1/auth/connect/token";
-const CONGA_DRIVE_API_BASE = process.env.CONGA_DRIVE_API_BASE || "";
 
 let cachedCongaToken   = "";
 let congaTokenExpiresAt = 0;
@@ -179,9 +178,9 @@ async function getCongaToken() {
   return inflightTokenReq;
 }
 
-/** Inject Conga bearer token for congaapitools___ and congaendreviewtool___ tool calls */
+/** Inject Conga bearer token for congaendreviewtool___ tool calls */
 async function maybeInjectAuth(toolName, args) {
-  const needsAuth = toolName.startsWith("congaapitools___") || toolName.startsWith("congaendreviewtool___");
+  const needsAuth = toolName.startsWith("congaendreviewtool___");
   if (!needsAuth) return args;
   if (args.Authorization && String(args.Authorization).trim()) return args;
   try {
@@ -273,35 +272,6 @@ async function getReviewExternalToken(reviewtype) {
 if (CONGA_CLIENT_ID && CONGA_CLIENT_SECRET) {
   getCongaToken().catch(() => {});
   console.log("Conga auth configured → tokens will be provisioned automatically");
-}
-
-// ── Direct Conga Drive API download (fallback for MCP 500 errors) ──────────
-async function downloadFileViaDriveApi(fileId) {
-  const base = CONGA_DRIVE_API_BASE.replace(/\/+$/, "");
-  const token = await getCongaToken();
-  const url = `${base}/files/${encodeURIComponent(fileId)}/download`;
-  logger.info("DRIVE_DOWNLOAD", { message: `Trying Drive API: ${url}` });
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Drive API ${res.status}: ${errText}`);
-  }
-  // The response is binary (file content). Return metadata about the download.
-  const contentType = res.headers.get("content-type") || "application/octet-stream";
-  const contentDisp = res.headers.get("content-disposition") || "";
-  const filenameMatch = contentDisp.match(/filename="?([^";\n]+)"?/i);
-  const filename = filenameMatch ? filenameMatch[1] : `${fileId}.bin`;
-  const buffer = await res.buffer();
-  return {
-    success: true,
-    filename,
-    contentType,
-    sizeBytes: buffer.length,
-    message: `File "${filename}" downloaded successfully (${(buffer.length / 1024).toFixed(1)} KB, type: ${contentType}).`,
-  };
 }
 
 // ── Tool definitions for the Hosted Agent ──────────────────────────────────
@@ -418,8 +388,11 @@ async function discoverMcpTools() {
   try {
     const response = await callFoundryToolbox("tools/list");
     const tools = response?.result?.tools || [];
-    mcpToolDefs = tools.map(convertMcpToolToOpenAI);
-    console.log(`MCP tool discovery → found ${mcpToolDefs.length} tools: ${mcpToolDefs.map(t => t.function.name).join(", ")}`);
+    // Only keep review tools (congaendreviewtool___*); skip congaapitools___ and congaauth___
+    const KEEP_PREFIXES = ["congaendreviewtool___"];
+    const filtered = tools.filter(t => KEEP_PREFIXES.some(p => t.name.startsWith(p)));
+    mcpToolDefs = filtered.map(convertMcpToolToOpenAI);
+    console.log(`MCP tool discovery → found ${tools.length} tools, kept ${mcpToolDefs.length}: ${mcpToolDefs.map(t => t.function.name).join(", ")}`);
   } catch (err) {
     console.error(`MCP tool discovery failed: ${err.message}`);
   }
@@ -727,11 +700,10 @@ Your job:
 
 IMPORTANT — Conga API tools:
 • Authentication (Authorization header, ExternalToken) is handled AUTOMATICALLY by the server. NEVER ask the user for tokens, credentials, client_id, client_secret, or any auth details.
-• For congaapitools___ tools (getPackageDocuments, downloadFile): just call them with the required business parameters. Authorization is injected automatically.
 • For congaendreviewtool___endReviewerReview: just call it with reviewtype, reviewid, and reviewerid. The server will automatically fetch the ExternalToken (via getReviewAuthorization) and inject the Authorization header. NEVER ask the user for ExternalToken or Authorization.
 • For congaendreviewtool___getReviewAuthorization: just call it with reviewtype. Authorization is injected automatically.
 • NEVER call congaauth___createBearerToken manually — the app handles authentication behind the scenes.
-• Only ask the user for BUSINESS parameters (packageId, fileId, reviewid, reviewerid, reviewtype, etc.).`;
+• Only ask the user for BUSINESS parameters (reviewid, reviewerid, reviewtype, etc.).`;
 }
 
 // ── Parse action JSON block from AI reply ─────────────────────────────────────
@@ -741,21 +713,6 @@ function parseActionFromReply(reply) {
     const match = reply.match(/\{\s*"action"\s*:.+?\}/s);
     if (match) return JSON.parse(match[0]);
   } catch {}
-  return null;
-}
-
-function extractPackageId(text = "") {
-  const input = String(text).trim();
-  if (!input) return null;
-
-  const labelled =
-    input.match(/package\s*id\s*[:=]\s*([A-Za-z0-9+/=._-]+)/i) ||
-    input.match(/packageid\s*[:=]\s*([A-Za-z0-9+/=._-]+)/i);
-  if (labelled?.[1]) return labelled[1].trim();
-
-  // Accept standalone token-like IDs (including Base64-ish values)
-  if (!/\s/.test(input) && /^[A-Za-z0-9+/=._-]{12,}$/.test(input)) return input;
-
   return null;
 }
 
@@ -853,42 +810,6 @@ async function executeToolCall(toolCall, contentControls) {
       } catch (err) {
         logger.error("REVIEW_FLOW", { message: `endReviewerReview failed: ${err.message}` });
         result = JSON.stringify({ success: false, error: err.message });
-      }
-      break;
-    }
-    case "congaapitools___downloadFile": {
-      // Direct download via Drive API (MCP Sign API returns 500)
-      const fileId = args.fileId || args.file_id || "";
-      if (!fileId) {
-        result = JSON.stringify({ success: false, error: "fileId is required" });
-        break;
-      }
-      if (CONGA_DRIVE_API_BASE) {
-        try {
-          const driveResult = await downloadFileViaDriveApi(fileId);
-          logger.info("DRIVE_DOWNLOAD", { message: `Download succeeded: ${driveResult.filename}` });
-          result = JSON.stringify(driveResult);
-        } catch (driveErr) {
-          logger.warn("DRIVE_DOWNLOAD", { message: `Drive API failed: ${driveErr.message}, falling back to MCP` });
-          // Fall back to MCP if Drive API also fails
-          try {
-            const enrichedArgs = await maybeInjectAuth(name, args);
-            const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
-            result = JSON.stringify({ success: true, result: mcpResult });
-          } catch (mcpErr) {
-            logger.error("MCP_TOOL", { message: `MCP downloadFile also failed: ${mcpErr.message}` });
-            result = JSON.stringify({ success: false, error: `Download failed from both Drive API (${driveErr.message}) and Sign API (${mcpErr.message})` });
-          }
-        }
-      } else {
-        // No Drive API configured, try MCP as usual
-        try {
-          const enrichedArgs = await maybeInjectAuth(name, args);
-          const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
-          result = JSON.stringify({ success: true, result: mcpResult });
-        } catch (err) {
-          result = JSON.stringify({ success: false, error: err.message });
-        }
       }
       break;
     }
@@ -995,30 +916,11 @@ app.post("/api/chat", async (req, res) => {
   const threadState = activeThreads.get(threadId) || {
     created: now,
     lastUsed: now,
-    pendingIntent: null,
   };
   threadState.lastUsed = now;
 
   const rawMessage = String(message || "").trim();
-  let effectiveMessage = rawMessage;
-
-  if (/^get\s*packagedocs$/i.test(rawMessage)) {
-    threadState.pendingIntent = "get_packagedocs";
-  } else if (/^download\s*doc$/i.test(rawMessage)) {
-    threadState.pendingIntent = "download_doc";
-  } else if (threadState.pendingIntent === "get_packagedocs") {
-    const packageId = extractPackageId(rawMessage);
-    if (packageId) {
-      effectiveMessage = `Get package docs for package id ${packageId}`;
-      threadState.pendingIntent = null;
-    }
-  } else if (threadState.pendingIntent === "download_doc") {
-    const packageId = extractPackageId(rawMessage);
-    if (packageId) {
-      effectiveMessage = `Download doc for package id ${packageId}`;
-      threadState.pendingIntent = null;
-    }
-  }
+  const effectiveMessage = rawMessage;
 
   activeThreads.set(threadId, threadState);
 
@@ -1032,7 +934,6 @@ app.post("/api/chat", async (req, res) => {
     userMessage: effectiveMessage,
     rawMessage,
     threadId,
-    pendingIntent: threadState.pendingIntent,
     contentControlCount: contentControls.length,
     docTextLength: docText.length,
     mode,
