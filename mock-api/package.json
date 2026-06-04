@@ -1,7 +1,7 @@
 {
-  "name": "docsense-ai-api",
+  "name": "conga-ai-assistance-api",
   "version": "1.0.0",
-  "description": "Mock API for DocSense AI — replace with Azure Function for production",
+  "description": "Mock API for Conga AI Assistance — replace with Azure Function for production",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

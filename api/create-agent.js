@@ -1,20 +1,29 @@
 /**
- * One-time script: creates the DocSense AI agent in Azure AI Foundry
+ * One-time script: creates the Conga AI Assistance agent in Azure OpenAI
  * and prints the AGENT_ID to add to .env
  *
  * Run: node create-agent.js
  */
 require("dotenv").config();
-const fetch = require("node-fetch");
+const { AzureOpenAI } = require("openai");
 
-const PROJECT_ENDPOINT = process.env.AZURE_PROJECT_ENDPOINT || "";
-const API_KEY          = process.env.AZURE_OPENAI_API_KEY   || "";
-const API_VERSION      = "2025-05-15-preview";
+const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
+const API_KEY  = process.env.AZURE_OPENAI_API_KEY  || "";
 
-if (!PROJECT_ENDPOINT || !API_KEY) {
-  console.error("Missing AZURE_PROJECT_ENDPOINT or AZURE_OPENAI_API_KEY in .env");
+if (!ENDPOINT || !API_KEY) {
+  console.error("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY in .env");
   process.exit(1);
 }
+
+// Assistants API requires the classic base endpoint (without /openai/v1 path)
+// Strip any /openai/v1 or /v1 suffix — the SDK adds the correct paths
+const baseEndpoint = ENDPOINT.replace(/\/openai\/v1\/?$/, "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+
+const client = new AzureOpenAI({
+  endpoint:   baseEndpoint,
+  apiKey:     API_KEY,
+  apiVersion: "2024-05-01-preview",
+});
 
 // ── Static instructions stored permanently in the agent ─────────────────────
 // Everything here is NOT billed as input tokens per call.
@@ -53,45 +62,28 @@ handle them one at a time and confirm before proceeding to the next.`;
 
 async function main() {
   console.log("Creating Conga AI Assistance agent...");
-  console.log(`Project endpoint: ${PROJECT_ENDPOINT}`);
-
-  // Use direct REST call — the AzureOpenAI SDK adds /openai/ prefix which
-  // is wrong for the Foundry project-scoped endpoint (/api/projects/...)
-  const url = `${PROJECT_ENDPOINT.replace(/\/+$/, "")}/assistants?api-version=${API_VERSION}`;
+  console.log(`Endpoint: ${baseEndpoint}`);
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "api-key": API_KEY
-      },
-      body: JSON.stringify({
-        model:        "gpt-4o",
-        name:         "Conga AI Assistance",
-        description:  "Contract intelligence assistant for Conga CLM contracts",
-        instructions: INSTRUCTIONS,
-        temperature:  0.2,
-        top_p:        1.0
-      })
+    const agent = await client.beta.assistants.create({
+      model:       "gpt-4o",
+      name:        "Conga AI Assistance",
+      description: "Contract intelligence assistant for Conga CLM contracts",
+      instructions: INSTRUCTIONS,
+      temperature: 0.2,
+      top_p:       1.0,
     });
 
-    const body = await res.json();
-    if (!res.ok) {
-      console.error("Failed to create agent:", JSON.stringify(body, null, 2));
-      process.exit(1);
-    }
-
-    const agent = body;
     console.log("\n✅ Agent created successfully!");
     console.log(`   Name  : ${agent.name}`);
     console.log(`   Model : ${agent.model}`);
     console.log(`   ID    : ${agent.id}`);
-    console.log("\nAdd this to api/.env and mock-api/.env:");
-    console.log(`   AZURE_AGENT_ID=${agent.id}`);
-    console.log("\nAgent instructions stored in Azure Foundry — visible at ai.azure.com → Agents");
+    console.log("\nAdd this to api/.env:");
+    console.log(`   AZURE_OPENAI_AGENT_ID=${agent.id}`);
+    console.log("\nAgent instructions stored in Azure — not billed per call.");
   } catch (err) {
     console.error("Failed to create agent:", err.message);
+    if (err.status) console.error("HTTP status:", err.status);
     process.exit(1);
   }
 }
