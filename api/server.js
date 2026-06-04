@@ -93,15 +93,16 @@ if (aiClient) {
 // Run `node create-agent.js` once to create the agent, then set AZURE_AGENT_ID in .env.
 // When configured, uses persistent threads for true multi-turn conversation memory.
 // Falls back to stateless chat.completions if AZURE_AGENT_ID is not set.
-const AZURE_AGENT_ID = process.env.AZURE_OPENAI_AGENT_ID || "";
+const AZURE_AGENT_ID = process.env.AZURE_AGENT_ID || "";
 
 function buildAssistantsClient() {
   if (!AZURE_API_KEY || !AZURE_AGENT_ID) return null;
-  // Assistants API requires a dedicated Foundry project endpoint (services.ai.azure.com).
-  // The v1-compatible OpenAI endpoint does NOT support beta.threads.runs.stream.
+  // Prefer the Foundry project endpoint (services.ai.azure.com) so agents appear
+  // in the Foundry portal. Fall back to stripping the OpenAI endpoint if not set.
   const foundryEndpoint = process.env.AZURE_FOUNDRY_ENDPOINT || "";
-  if (!foundryEndpoint) return null;
-  const baseEndpoint = foundryEndpoint.replace(/\/+$/, "");
+  const baseEndpoint = foundryEndpoint
+    ? foundryEndpoint.replace(/\/+$/, "")
+    : AZURE_ENDPOINT.replace(/\/openai\/v1\/?$/, "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
   return new AzureOpenAI({ endpoint: baseEndpoint, apiKey: AZURE_API_KEY, apiVersion: "2025-01-01-preview" });
 }
 
@@ -109,7 +110,7 @@ const assistantsClient = buildAssistantsClient();
 if (assistantsClient) {
   console.log(`Azure AI Agent connected → agent: ${AZURE_AGENT_ID}`);
 } else {
-  console.log("Azure AI Agent not configured — set AZURE_OPENAI_AGENT_ID in .env to enable persistent threads");
+  console.log("Azure AI Agent not configured — set AZURE_AGENT_ID in .env to enable persistent threads");
 }
 
 // ── Tool-calling mode flag ─────────────────────────────────────────────────────
@@ -125,7 +126,6 @@ const activeThreads = new Map();
 
 // ── Foundry Toolbox MCP client ─────────────────────────────────────────────
 const FOUNDRY_TOOLBOX_URL = process.env.FOUNDRY_TOOLBOX_URL || "";
-const FOUNDRY_API_KEY     = process.env.FOUNDRY_API_KEY || AZURE_API_KEY;
 
 async function callFoundryToolbox(method, params = {}) {
   if (!FOUNDRY_TOOLBOX_URL) {
@@ -142,7 +142,7 @@ async function callFoundryToolbox(method, params = {}) {
   const res = await fetch(FOUNDRY_TOOLBOX_URL, {
     method: "POST",
     headers: {
-      "api-key": FOUNDRY_API_KEY,
+      "api-key": AZURE_API_KEY,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -674,7 +674,10 @@ function parseCustomXmlMetadata(zip) {
 function buildSystemPrompt(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
-    const name    = cc.tag   || cc.title || "Unnamed";
+    // Use human-readable clauseName when available; fall back to numeric tag
+    const name    = cc.clauseName
+      ? `${cc.clauseName} [Tag: ${cc.tag}]`
+      : (cc.tag || cc.title || "Unnamed");
     const preview = cc.text  ? cc.text.substring(0, 300) : "(no text)";
 
     // Surface key metadata flags so the AI understands the contract state
@@ -734,7 +737,10 @@ IMPORTANT — Conga API tools:
 function buildDocumentContext(contentControls, docText, documentProps) {
   const ccLines = contentControls.map((cc) => {
     const type    = cc.type  || "Control";
-    const name    = cc.tag   || cc.title || "Unnamed";
+    // Use human-readable clauseName when available; fall back to numeric tag
+    const name    = cc.clauseName
+      ? `${cc.clauseName} [Tag: ${cc.tag}]`
+      : (cc.tag || cc.title || "Unnamed");
     const text    = cc.text  || "(no text)";
     const flags = [
       cc.SubType             ? `SubType:${cc.SubType}`                : null,
@@ -958,42 +964,101 @@ async function chatWithTools(systemPrompt, userMessage, contentControls, history
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
-  const { message = "", contentControls = [], docText = "", threadId: incomingThreadId } = req.body;
+  const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
+  let threadId = reqThreadId;
   const reqId = Date.now().toString(36);
-
-  const now = Date.now();
-  const hasIncomingThread = incomingThreadId && activeThreads.has(incomingThreadId);
-  const threadId = hasIncomingThread
-    ? incomingThreadId
-    : `t-${now.toString(36)}-${Math.floor(Math.random() * 100000).toString(36)}`;
-
-  const threadState = activeThreads.get(threadId) || {
-    created: now,
-    lastUsed: now,
-  };
-  threadState.lastUsed = now;
-
-  const rawMessage = String(message || "").trim();
-  const effectiveMessage = rawMessage;
-
-  activeThreads.set(threadId, threadState);
-
-  // Determine mode
-  const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
-  const mode = aiClient ? (hasTools ? "tool-calling" : "prompt-agent") : "keyword-fallback";
 
   logger.info("CHAT_REQ", {
     message: `Chat request [${reqId}]`,
     reqId,
-    userMessage: effectiveMessage,
-    rawMessage,
-    threadId,
+    userMessage: message,
     contentControlCount: contentControls.length,
+    contentControls: contentControls.map(cc => ({ id: cc.id, tag: cc.tag, type: cc.type })),
     docTextLength: docText.length,
-    mode,
+    mode: aiClient ? "azure-openai" : "keyword-fallback"
   });
 
+  // ── Agent path (Azure AI Foundry — Assistants API with persistent threads) ──
+  if (assistantsClient && AZURE_AGENT_ID) {
+    try {
+      if (!threadId) {
+        const thread = await assistantsClient.beta.threads.create();
+        threadId = thread.id;
+      }
+
+      await assistantsClient.beta.threads.messages.create(threadId, {
+        role: "user",
+        content: message
+      });
+
+      const docContext = buildDocumentContext(contentControls, docText, null);
+
+      logger.debug("AGENT_REQ", {
+        message: `Agent run [${reqId}]`,
+        reqId, threadId,
+        agentId: AZURE_AGENT_ID,
+        docContextLength: docContext.length
+      });
+
+      const run = await assistantsClient.beta.threads.runs.createAndPoll(threadId, {
+        assistant_id: AZURE_AGENT_ID,
+        additional_instructions: docContext
+      });
+
+      if (run.status !== "completed") {
+        throw new Error(`Agent run ended with status: ${run.status}. ${run.last_error?.message || ""}`);
+      }
+
+      const msgList  = await assistantsClient.beta.threads.messages.list(threadId, { limit: 1, order: "desc" });
+      const latestMsg = msgList.data[0];
+      const rawReply  = latestMsg?.content
+        ?.filter((c) => c.type === "text")
+        .map((c) => c.text.value)
+        .join("") || "No response from agent.";
+
+      logger.info("AGENT_RES", {
+        message: `Agent response [${reqId}]`,
+        reqId, threadId,
+        promptTokens: run.usage?.prompt_tokens,
+        completionTokens: run.usage?.completion_tokens,
+        rawReply
+      });
+
+      const action     = parseActionFromReply(rawReply);
+      const cleanReply = rawReply.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
+
+      const response = { reply: cleanReply, threadId };
+
+      if (action?.action === "navigate") {
+        const found = findClause(action.tag, contentControls);
+        response.navigateTo       = action.tag;
+        response.contentControlId = found?.id;
+      }
+      if (action?.action === "update") {
+        response.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
+      }
+      if (action?.action === "insert") {
+        response.insertAction = { tag: action.tag, text: action.text };
+      }
+
+      logger.info("CHAT_RES", {
+        message: `Chat response [${reqId}]`,
+        reqId,
+        replyLength: cleanReply.length,
+        action: action?.action || null,
+        navigateTo: response.navigateTo || null
+      });
+
+      return res.json(response);
+
+    } catch (err) {
+      logger.error("AGENT_ERR", { message: `Agent error [${reqId}]`, reqId, threadId, error: err.message });
+      // Fall through to stateless chat.completions fallback below
+    }
+  }
+
   // ── Chat Completions + Tool Calling ─────────────────────────────────────
+  const hasTools = DOCUMENT_TOOLS.length > 0 || mcpToolDefs.length > 0;
   if (aiClient && hasTools) {
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
@@ -1003,12 +1068,12 @@ app.post("/api/chat", async (req, res) => {
         reqId,
         deployment: AZURE_DEPLOYMENT,
         toolCount: DOCUMENT_TOOLS.length + mcpToolDefs.length,
-        userMessage: effectiveMessage,
+        userMessage: message,
         threadId
       });
 
       const { reply, actions, usage } = await chatWithTools(
-        systemPrompt, effectiveMessage, contentControls
+        systemPrompt, message, contentControls
       );
 
       logger.info("TOOL_CHAT_RES", {
@@ -1064,7 +1129,7 @@ app.post("/api/chat", async (req, res) => {
         model: AZURE_DEPLOYMENT,
         messages: [
           { role: "system",  content: systemPrompt },
-          { role: "user",    content: effectiveMessage }
+          { role: "user",    content: message }
         ],
         temperature: 0.2,
         max_tokens: 800
@@ -1110,7 +1175,7 @@ app.post("/api/chat", async (req, res) => {
   }
 
   // ── Keyword fallback (no AI configured or AI error) ──────────────────────
-  const msg = effectiveMessage.toLowerCase();
+  const msg = message.toLowerCase();
 
   if (msg.includes("list") || msg.includes("all clause") || msg.includes("show clause") || msg.includes("what clause")) {
     return res.json({ reply: formatClauseList(contentControls), threadId });
@@ -1292,24 +1357,10 @@ Return ONLY the JSON array.`;
 
 app.post("/api/chat/stream", async (req, res) => {
   const { message = "", contentControls = [], docText = "", threadId: reqThreadId = null } = req.body;
-  const now = Date.now();
-  let threadId = reqThreadId && activeThreads.has(reqThreadId)
-    ? reqThreadId
-    : `t-${now.toString(36)}-${Math.floor(Math.random() * 100000).toString(36)}`;
+  let threadId = reqThreadId;
+  const reqId = Date.now().toString(36);
 
-  // Retrieve or create thread state with conversation history
-  const threadState = activeThreads.get(threadId) || { created: now, lastUsed: now, history: [] };
-  threadState.lastUsed = now;
-  // Append the new user message
-  threadState.history.push({ role: "user", content: message });
-  // Cap history to last 20 messages to prevent token overflow
-  if (threadState.history.length > 20) {
-    threadState.history = threadState.history.slice(-20);
-  }
-  activeThreads.set(threadId, threadState);
-
-  const reqId = now.toString(36);
-
+  // Set SSE headers immediately so the browser can start reading
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -1329,7 +1380,8 @@ app.post("/api/chat/stream", async (req, res) => {
       }
 
       await assistantsClient.beta.threads.messages.create(threadId, {
-        role: "user", content: message
+        role: "user",
+        content: message
       });
 
       const docContext = buildDocumentContext(contentControls, docText, null);
@@ -1381,52 +1433,8 @@ app.post("/api/chat/stream", async (req, res) => {
     }
   }
 
-  // ── chat.completions + tool calling path ────────────────────────────────────
+  // ── chat.completions path (streaming) ──────────────────────────────────────
   if (aiClient) {
-    const allTools = [...DOCUMENT_TOOLS, ...mcpToolDefs];
-    const hasTools = allTools.length > 0;
-
-    // When tools are available, use the tool-calling loop (non-streaming)
-    // so MCP tools (End Review, etc.) actually execute.
-    if (hasTools) {
-      try {
-        const systemPrompt = buildSystemPrompt(contentControls, docText, null);
-        sendEvent({ type: "token", text: "" }); // signal streaming started
-
-        const { reply, actions } = await chatWithTools(
-          systemPrompt, message, contentControls, threadState.history
-        );
-
-        // Save assistant reply to thread history
-        threadState.history.push({ role: "assistant", content: reply });
-
-        const done = { type: "done", reply, threadId };
-        for (const action of actions) {
-          if (action.type === "navigate") {
-            done.navigateTo       = action.tag;
-            done.contentControlId = action.contentControlId;
-          }
-          if (action.type === "update") {
-            done.updateAction = { tag: action.tag, find: action.find, replace: action.replace };
-          }
-          if (action.type === "insert") {
-            done.insertAction = { tag: action.tag, text: action.text };
-          }
-          if (action.type === "delete") {
-            done.deleteAction = { tag: action.tag, contentControlId: action.contentControlId };
-          }
-        }
-
-        sendEvent(done);
-        endStream();
-        return;
-      } catch (err) {
-        logger.error("STREAM_TOOL_ERR", { message: `Tool-calling stream error [${reqId}]`, reqId, error: err.message });
-        // Fall through to plain streaming
-      }
-    }
-
-    // Plain streaming (no tools, or tool path failed)
     try {
       const systemPrompt = buildSystemPrompt(contentControls, docText, null);
       let fullText = "";
@@ -1435,7 +1443,7 @@ app.post("/api/chat/stream", async (req, res) => {
         model: AZURE_DEPLOYMENT,
         messages: [
           { role: "system", content: systemPrompt },
-          ...threadState.history
+          { role: "user",   content: message }
         ],
         temperature: 0.2,
         max_tokens: 800,
@@ -1452,9 +1460,6 @@ app.post("/api/chat/stream", async (req, res) => {
 
       const action     = parseActionFromReply(fullText);
       const cleanReply = fullText.replace(/\{\s*"action"\s*:.+?\}/s, "").trim();
-
-      threadState.history.push({ role: "assistant", content: cleanReply });
-
       const done = { type: "done", reply: cleanReply, threadId };
 
       if (action?.action === "navigate") {
@@ -1606,6 +1611,22 @@ app.post("/api/end-review", async (req, res) => {
     });
 
     logger.info("END_REVIEW", { message: "endReviewerReview completed", reqId, result: JSON.stringify(mcpResult).substring(0, 500) });
+
+    // Check JSON-RPC level error
+    if (mcpResult.error) {
+      const errMsg = mcpResult.error.message || JSON.stringify(mcpResult.error);
+      logger.error("END_REVIEW_ERR", { message: `MCP JSON-RPC error [${reqId}]`, reqId, error: errMsg });
+      return res.status(500).json({ success: false, error: errMsg });
+    }
+
+    // Check MCP tool-level error (isError: true in result)
+    const toolResult = mcpResult.result ?? mcpResult;
+    if (toolResult.isError) {
+      const errText = toolResult.content?.map(c => c.text).join(" ") || "Tool returned an error.";
+      logger.error("END_REVIEW_ERR", { message: `MCP tool error [${reqId}]`, reqId, error: errText });
+      return res.status(500).json({ success: false, error: errText });
+    }
+
     return res.json({ success: true, message: "Review ended successfully.", result: mcpResult });
 
   } catch (err) {
