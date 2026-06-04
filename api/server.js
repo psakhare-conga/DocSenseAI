@@ -1612,11 +1612,26 @@ app.post("/api/end-review", async (req, res) => {
 
     logger.info("END_REVIEW", { message: "endReviewerReview completed", reqId, result: JSON.stringify(mcpResult).substring(0, 500) });
 
-    // Check JSON-RPC level error
+    // Check JSON-RPC level error — extract a friendly message from the MCP wrapper
     if (mcpResult.error) {
-      const errMsg = mcpResult.error.message || JSON.stringify(mcpResult.error);
-      logger.error("END_REVIEW_ERR", { message: `MCP JSON-RPC error [${reqId}]`, reqId, error: errMsg });
-      return res.status(500).json({ success: false, error: errMsg });
+      const rawErrMsg = mcpResult.error.message || JSON.stringify(mcpResult.error);
+      logger.error("END_REVIEW_ERR", { message: `MCP JSON-RPC error [${reqId}]`, reqId, error: rawErrMsg });
+      // Parse the MCP error to extract a user-friendly message
+      let friendlyError = rawErrMsg;
+      const detailMatch = rawErrMsg.match(/"detail"\s*:\s*"([^"]+)"/);
+      if (detailMatch) {
+        friendlyError = detailMatch[1];
+      } else {
+        const httpMatch = rawErrMsg.match(/HTTP error (\d+):\s*([^'"]+)/);
+        if (httpMatch) {
+          const status = httpMatch[1];
+          if (status === "400") friendlyError = "The review may already be completed or is in an invalid state for this action.";
+          else if (status === "401" || status === "403") friendlyError = "Authorization failed. Check your Conga credentials.";
+          else if (status === "404") friendlyError = "Review or reviewer not found. Check the Review ID and Reviewer ID.";
+          else friendlyError = `Conga API error (HTTP ${status}): ${httpMatch[2].trim()}`;
+        }
+      }
+      return res.status(400).json({ success: false, error: friendlyError });
     }
 
     // Check MCP tool-level error (isError: true in result)
