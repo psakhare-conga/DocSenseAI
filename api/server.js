@@ -139,6 +139,7 @@ const CONGA_CLIENT_ID     = process.env.CONGA_CLIENT_ID || "";
 const CONGA_CLIENT_SECRET = process.env.CONGA_CLIENT_SECRET || "";
 const CONGA_SCOPE         = process.env.CONGA_SCOPE || "sign";
 const CONGA_AUTH_URL      = process.env.CONGA_AUTH_URL || "https://login-rlsdev.congacloud.io/api/v1/auth/connect/token";
+const CONGA_DRIVE_API_BASE = process.env.CONGA_DRIVE_API_BASE || "";
 
 let cachedCongaToken   = "";
 let congaTokenExpiresAt = 0;
@@ -178,9 +179,10 @@ async function getCongaToken() {
   return inflightTokenReq;
 }
 
-/** Inject Conga bearer token for congaapitools___ tool calls */
+/** Inject Conga bearer token for congaapitools___ and congaendreviewtool___ tool calls */
 async function maybeInjectAuth(toolName, args) {
-  if (!toolName.startsWith("congaapitools___")) return args;
+  const needsAuth = toolName.startsWith("congaapitools___") || toolName.startsWith("congaendreviewtool___");
+  if (!needsAuth) return args;
   if (args.Authorization && String(args.Authorization).trim()) return args;
   try {
     const token = await getCongaToken();
@@ -191,10 +193,115 @@ async function maybeInjectAuth(toolName, args) {
   }
 }
 
+/**
+ * Call getReviewAuthorization via MCP to obtain the ExternalToken needed
+ * by the endReviewerReview endpoint (Office365 flow).
+ */
+async function getReviewExternalToken(reviewtype) {
+  const token = await getCongaToken();
+  const authResult = await callFoundryToolbox("tools/call", {
+    name: "congaendreviewtool___getReviewAuthorization",
+    arguments: {
+      reviewtype: reviewtype || "Office365",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  // Extract external token from MCP response
+  let externalToken = "";
+  try {
+    const payload = authResult?.result;
+
+    // Log the content parts specifically (not the huge _meta block)
+    if (payload?.content) {
+      const contentTexts = payload.content.map(c => c.text || "").join("");
+      logger.info("REVIEW_AUTH", { message: "Response content", content: contentTexts.substring(0, 2000) });
+    } else {
+      logger.info("REVIEW_AUTH", { message: "Full response (no content array)", result: JSON.stringify(authResult).substring(0, 2000) });
+    }
+
+    if (payload?.content) {
+      // MCP content array format: [{ type: "text", text: "..." }]
+      const textContent = payload.content.find(c => c.type === "text");
+      if (textContent && textContent.text) {
+        const raw = textContent.text.trim();
+        // Try parsing as JSON
+        try {
+          const parsed = JSON.parse(raw);
+          // Conga Review API returns: { Value: { Token: { AuthToken: "..." } } }
+          externalToken = parsed?.Value?.Token?.AuthToken
+            || parsed?.value?.token?.authToken
+            || parsed.externalToken || parsed.ExternalToken
+            || parsed.token || parsed.Token
+            || parsed.access_token || parsed.accessToken
+            || parsed.authUrl || parsed.authURL || parsed.auth_url
+            || "";
+          // If parsed is a plain string, use it directly
+          if (!externalToken && typeof parsed === "string") externalToken = parsed;
+          // If parsed has a nested data/value object
+          if (!externalToken && parsed.data) {
+            externalToken = parsed.data.externalToken || parsed.data.token || parsed.data.access_token || "";
+          }
+          // If parsed has a redirectUrl with token in query params
+          if (!externalToken && (parsed.redirectUrl || parsed.url)) {
+            const url = parsed.redirectUrl || parsed.url;
+            const match = url.match(/[?&](?:token|code|access_token)=([^&]+)/i);
+            if (match) externalToken = decodeURIComponent(match[1]);
+            else externalToken = url; // pass the whole URL as external token
+          }
+        } catch {
+          // Not JSON — use the raw text as the token
+          externalToken = raw;
+        }
+      }
+    } else if (typeof payload === "string") {
+      externalToken = payload;
+    }
+  } catch (err) {
+    logger.warn("REVIEW_AUTH", { message: `Could not parse external token: ${err.message}` });
+  }
+
+  if (externalToken) {
+    logger.info("REVIEW_AUTH", { message: `ExternalToken obtained (${externalToken.length} chars)` });
+  } else {
+    logger.warn("REVIEW_AUTH", { message: "ExternalToken could not be extracted from response" });
+  }
+  return externalToken;
+}
+
 // Warm up Conga token on startup if credentials are set
 if (CONGA_CLIENT_ID && CONGA_CLIENT_SECRET) {
   getCongaToken().catch(() => {});
   console.log("Conga auth configured → tokens will be provisioned automatically");
+}
+
+// ── Direct Conga Drive API download (fallback for MCP 500 errors) ──────────
+async function downloadFileViaDriveApi(fileId) {
+  const base = CONGA_DRIVE_API_BASE.replace(/\/+$/, "");
+  const token = await getCongaToken();
+  const url = `${base}/files/${encodeURIComponent(fileId)}/download`;
+  logger.info("DRIVE_DOWNLOAD", { message: `Trying Drive API: ${url}` });
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Drive API ${res.status}: ${errText}`);
+  }
+  // The response is binary (file content). Return metadata about the download.
+  const contentType = res.headers.get("content-type") || "application/octet-stream";
+  const contentDisp = res.headers.get("content-disposition") || "";
+  const filenameMatch = contentDisp.match(/filename="?([^";\n]+)"?/i);
+  const filename = filenameMatch ? filenameMatch[1] : `${fileId}.bin`;
+  const buffer = await res.buffer();
+  return {
+    success: true,
+    filename,
+    contentType,
+    sizeBytes: buffer.length,
+    message: `File "${filename}" downloaded successfully (${(buffer.length / 1024).toFixed(1)} KB, type: ${contentType}).`,
+  };
 }
 
 // ── Tool definitions for the Hosted Agent ──────────────────────────────────
@@ -286,8 +393,12 @@ let mcpToolDefs = []; // populated by discoverMcpTools()
 
 function convertMcpToolToOpenAI(mcpTool) {
   const schema = mcpTool.inputSchema || { type: "object", properties: {} };
-  // Remove Authorization from required since we auto-inject it server-side
-  const required = (schema.required || []).filter(r => r !== "Authorization");
+  // Remove auth-related params since we auto-inject them server-side
+  const AUTO_INJECTED = new Set(["Authorization", "ExternalToken"]);
+  const required = (schema.required || []).filter(r => !AUTO_INJECTED.has(r));
+  // Also strip them from properties so the model never tries to supply them
+  const properties = { ...(schema.properties || {}) };
+  for (const key of AUTO_INJECTED) delete properties[key];
   return {
     type: "function",
     function: {
@@ -295,7 +406,7 @@ function convertMcpToolToOpenAI(mcpTool) {
       description: mcpTool.description || `MCP tool: ${mcpTool.name}`,
       parameters: {
         type: "object",
-        properties: schema.properties || {},
+        properties,
         ...(required.length ? { required } : {}),
       },
     },
@@ -612,7 +723,15 @@ Your job:
 5. If the user asks to insert or add a BRAND NEW clause or section to the document, include:
    {"action":"insert","tag":"<new clause name>","text":"<full text of the new clause>"}
 6. If the user asks to list clauses or fields, list them clearly.
-7. Be concise. Do not hallucinate content not present in the document.`;
+7. Be concise. Do not hallucinate content not present in the document.
+
+IMPORTANT — Conga API tools:
+• Authentication (Authorization header, ExternalToken) is handled AUTOMATICALLY by the server. NEVER ask the user for tokens, credentials, client_id, client_secret, or any auth details.
+• For congaapitools___ tools (getPackageDocuments, downloadFile): just call them with the required business parameters. Authorization is injected automatically.
+• For congaendreviewtool___endReviewerReview: just call it with reviewtype, reviewid, and reviewerid. The server will automatically fetch the ExternalToken (via getReviewAuthorization) and inject the Authorization header. NEVER ask the user for ExternalToken or Authorization.
+• For congaendreviewtool___getReviewAuthorization: just call it with reviewtype. Authorization is injected automatically.
+• NEVER call congaauth___createBearerToken manually — the app handles authentication behind the scenes.
+• Only ask the user for BUSINESS parameters (packageId, fileId, reviewid, reviewerid, reviewtype, etc.).`;
 }
 
 // ── Parse action JSON block from AI reply ─────────────────────────────────────
@@ -697,6 +816,79 @@ async function executeToolCall(toolCall, contentControls) {
         result = JSON.stringify({ found: true, tag: found.tag, id: found.id, type: found.type, text: (found.text || "").substring(0, 300) });
       } else {
         result = JSON.stringify({ found: false, message: `No clause matching "${args.keyword}" found.` });
+      }
+      break;
+    }
+    case "congaendreviewtool___endReviewerReview": {
+      // Orchestrated flow: get ExternalToken via authorize, then call end review
+      const reviewtype = args.reviewtype || "Office365";
+      const reviewid = args.reviewid || "";
+      const reviewerid = args.reviewerid || "";
+      if (!reviewid || !reviewerid) {
+        result = JSON.stringify({ success: false, error: "reviewid and reviewerid are required" });
+        break;
+      }
+      try {
+        // Step 1: Get ExternalToken via getReviewAuthorization
+        let externalToken = args.ExternalToken || "";
+        if (!externalToken) {
+          logger.info("REVIEW_FLOW", { message: `Fetching ExternalToken for reviewtype=${reviewtype}` });
+          externalToken = await getReviewExternalToken(reviewtype);
+          if (!externalToken) {
+            logger.warn("REVIEW_FLOW", { message: "ExternalToken could not be obtained from authorize endpoint" });
+          }
+        }
+        // Step 2: Call endReviewerReview with all params + ExternalToken
+        const enrichedArgs = await maybeInjectAuth(name, {
+          ...args,
+          reviewtype,
+          reviewid,
+          reviewerid,
+          ExternalToken: externalToken,
+        });
+        logger.info("REVIEW_FLOW", { message: `Calling endReviewerReview: reviewid=${reviewid}, reviewerid=${reviewerid}` });
+        const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
+        logger.info("REVIEW_FLOW", { message: "endReviewerReview completed", result: JSON.stringify(mcpResult).substring(0, 500) });
+        result = JSON.stringify({ success: true, result: mcpResult });
+      } catch (err) {
+        logger.error("REVIEW_FLOW", { message: `endReviewerReview failed: ${err.message}` });
+        result = JSON.stringify({ success: false, error: err.message });
+      }
+      break;
+    }
+    case "congaapitools___downloadFile": {
+      // Direct download via Drive API (MCP Sign API returns 500)
+      const fileId = args.fileId || args.file_id || "";
+      if (!fileId) {
+        result = JSON.stringify({ success: false, error: "fileId is required" });
+        break;
+      }
+      if (CONGA_DRIVE_API_BASE) {
+        try {
+          const driveResult = await downloadFileViaDriveApi(fileId);
+          logger.info("DRIVE_DOWNLOAD", { message: `Download succeeded: ${driveResult.filename}` });
+          result = JSON.stringify(driveResult);
+        } catch (driveErr) {
+          logger.warn("DRIVE_DOWNLOAD", { message: `Drive API failed: ${driveErr.message}, falling back to MCP` });
+          // Fall back to MCP if Drive API also fails
+          try {
+            const enrichedArgs = await maybeInjectAuth(name, args);
+            const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
+            result = JSON.stringify({ success: true, result: mcpResult });
+          } catch (mcpErr) {
+            logger.error("MCP_TOOL", { message: `MCP downloadFile also failed: ${mcpErr.message}` });
+            result = JSON.stringify({ success: false, error: `Download failed from both Drive API (${driveErr.message}) and Sign API (${mcpErr.message})` });
+          }
+        }
+      } else {
+        // No Drive API configured, try MCP as usual
+        try {
+          const enrichedArgs = await maybeInjectAuth(name, args);
+          const mcpResult = await callFoundryToolbox("tools/call", { name, arguments: enrichedArgs });
+          result = JSON.stringify({ success: true, result: mcpResult });
+        } catch (err) {
+          result = JSON.stringify({ success: false, error: err.message });
+        }
       }
       break;
     }

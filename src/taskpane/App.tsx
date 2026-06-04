@@ -64,7 +64,7 @@ export default function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\"\n• \"Get PackageDocs\"\n• \"Download Doc\""
+      text: "Hi! I'm DocSense AI. I can help you navigate and understand your contract.\n\nTry asking:\n• \"List all clauses\"\n• \"Find the payment clause\"\n• \"Summarize the termination clause\"\n• \"What are the obligations?\"\n• \"End Review\""
     }
   ]);
   const [input, setInput] = useState("");
@@ -449,8 +449,7 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
-        <button onClick={() => quickActionAndSend("Get Package Docs")}>Get Package Document <details></details></button>
-        <button onClick={() => quickActionAndSend("Download Doc")}>Download Document using file Id</button>
+        <button onClick={() => quickAction("End review for reviewtype=Office365 reviewid= reviewerid=")}>End Review</button>
         <button onClick={() => quickAction("List all clauses in this document")}>
           List Clauses
         </button>
