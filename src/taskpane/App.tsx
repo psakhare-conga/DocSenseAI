@@ -7,6 +7,71 @@ import { DocInfoPanel } from "./DocInfoPanel";
 declare const process: { env: { API_URL: string } };
 const API_URL = process.env.API_URL || "http://localhost:5000";
 
+// ─── Browser-native GZIP decompression (mirrors DocInfoPanel) ────────────────
+async function gunzipBase64(base64: string): Promise<string> {
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ds = new (window as any).DecompressionStream("gzip");
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+  writer.write(bytes);
+  writer.close();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value as Uint8Array);
+  }
+  const total = chunks.reduce((a: number, c: Uint8Array) => a + c.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  return new TextDecoder().decode(buf);
+}
+
+// Build { [ccId]: clauseName } map by client-side parsing Conga custom XML.
+// Uses DOMParser + localName so namespace prefixes (ns0:Tag, etc.) are handled
+// correctly — the same approach used by DocInfoPanel.
+async function buildTagMapFromXml(xmlStrings: string[]): Promise<Record<string, string>> {
+  const CONGA_NS = "http://www.apttus.com/schemas";
+  const tagMap: Record<string, string> = {};
+  const parser = new DOMParser();
+
+  for (const xml of xmlStrings) {
+    if (!xml.includes(CONGA_NS)) continue;
+    const doc = parser.parseFromString(xml, "application/xml");
+    const nodes = doc.getElementsByTagName("Node");
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      const id = node.getAttribute("p2:id") || node.getAttribute("id") || "";
+      const base64 = node.textContent?.trim() || "";
+      if (!id || !base64) continue;
+      try {
+        const decompressed = await gunzipBase64(base64);
+        const metaDoc = parser.parseFromString(decompressed, "application/xml");
+        // Use localName so namespace-prefixed elements (ns0:Tag, etc.) are found
+        const all = metaDoc.getElementsByTagName("*");
+        let clauseName = "";
+        for (let j = 0; j < all.length; j++) {
+          if (all[j].localName === "Tag") {
+            clauseName = all[j].textContent?.trim() || "";
+            break;
+          }
+        }
+        if (!clauseName) continue;
+        const register = (key: string) => { if (key) tagMap[key] = clauseName; };
+        register(id);
+        const asNum = parseInt(id, 10);
+        if (!isNaN(asNum)) {
+          register((asNum >>> 0).toString());
+          register(asNum.toString());
+        }
+      } catch { /* skip malformed node */ }
+    }
+  }
+  return tagMap;
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface ContentControl {
@@ -199,21 +264,33 @@ export default function App() {
       return;
     }
 
-    // Enrich content controls with human-readable clause names from Conga metadata
+    // Enrich content controls with human-readable clause names from Conga metadata.
+    // Parse client-side (same approach as DocInfoPanel) so namespace-prefixed
+    // elements like <ns0:Tag> are handled correctly via localName.
     if (xmlStrings.length) {
       try {
-        const resp = await fetch(`${API_URL}/api/parse-xml-metadata`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ xmlStrings })
-        });
-        if (resp.ok) {
-          const { tagMap = {} } = await resp.json();
-          tagMapRef.current = tagMap; // persist for use in refreshContentControls
+        const tagMap = await buildTagMapFromXml(xmlStrings);
+        if (Object.keys(tagMap).length) {
+          tagMapRef.current = tagMap;
           loaded = loaded.map((cc) => ({
             ...cc,
             clauseName: tagMap[cc.id.toString()] || tagMap[String(cc.id >>> 0)] || undefined
           }));
+        } else {
+          // Fallback: server-side parse (legacy path)
+          const resp = await fetch(`${API_URL}/api/parse-xml-metadata`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ xmlStrings })
+          });
+          if (resp.ok) {
+            const { tagMap: serverTagMap = {} } = await resp.json();
+            tagMapRef.current = serverTagMap;
+            loaded = loaded.map((cc) => ({
+              ...cc,
+              clauseName: serverTagMap[cc.id.toString()] || serverTagMap[String(cc.id >>> 0)] || undefined
+            }));
+          }
         }
       } catch { /* non-fatal — display falls back to text snippet */ }
     }
@@ -605,36 +682,47 @@ export default function App() {
   const applySuggestion = async (r: RiskResult, suggestedText: string) => {
     const cc = contentControls.find(c => c.id === r.id);
     if (!cc) return;
+    if (cc.cannotEdit) {
+      addSystemMessage(`❌ "${cc.clauseName || cc.tag}" is locked for editing (read-only).`);
+      return;
+    }
     try {
       await Word.run(async (context) => {
         const wordCc = context.document.contentControls.getById(cc.id);
 
-        // Read current tracking mode so we can restore it after.
-        // Use a fallback in case the property isn't accessible (e.g. protected doc).
+        // Step 1: Try to enable track changes, syncing immediately so any
+        // GeneralException (thrown by review-mode protected docs) is caught here
+        // rather than crashing the whole Word.run. If the doc is already in
+        // trackAll protection mode, Word tracks the edit automatically anyway.
         let prevMode: Word.ChangeTrackingMode = Word.ChangeTrackingMode.off;
+        let trackingChanged = false;
         try {
           context.document.load("changeTrackingMode");
           await context.sync();
           prevMode = context.document.changeTrackingMode as Word.ChangeTrackingMode;
+          if (prevMode !== Word.ChangeTrackingMode.trackAll) {
+            context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+            await context.sync(); // throws GeneralException on review-protected docs
+            trackingChanged = true;
+          }
         } catch {
-          // If we can't read the mode, assume off and proceed
+          // Document is already in a tracked-changes protection mode — proceed as-is.
+          trackingChanged = false;
         }
 
-        // Enable track changes — the full rewrite is recorded as a redline.
-        // Word preserves the content control's existing paragraph formatting
-        // automatically in the tracked markup, so no manual font reapplication needed.
-        context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+        // Step 2: Apply the fix as a full content control replacement.
         wordCc.insertText(suggestedText, "Replace");
         await context.sync();
 
-        // Restore original mode — if doc was already in trackAll, it stays that way
-        context.document.changeTrackingMode = prevMode;
-        await context.sync();
+        // Step 3: Restore original mode only if we changed it.
+        if (trackingChanged) {
+          try { context.document.changeTrackingMode = prevMode; await context.sync(); } catch { /* ignore */ }
+        }
       });
       setSuggestions(prev => ({ ...prev, [r.id]: { ...prev[r.id], visible: false } }));
       setFixedIds(prev => new Set(prev).add(r.id));
       refreshContentControls();
-      addSystemMessage(`✅ Tracked change applied to "${cc.clauseName || cc.tag}" — accept or reject in Word's Review ribbon.`);
+      addSystemMessage(`✅ Change applied to "${cc.clauseName || cc.tag}" — accept or reject in Word's Review ribbon.`);
     } catch (err) {
       addSystemMessage(`Failed to apply fix: ${err}`);
     }
@@ -775,6 +863,16 @@ export default function App() {
   // ── Dynamic clause buttons — derived from loaded document content controls ─
   // Only shows clauses actually present in the document. No static fallbacks.
   const clauseQuickActions = React.useMemo(() => {
+    // Word's default placeholder strings — useless as button labels
+    const WORD_PLACEHOLDERS = new Set([
+      "click or tap here to enter text.",
+      "click or tap here to enter text",
+      "click or tap to enter text.",
+      "click or tap to enter text",
+      "enter text here",
+      "type here",
+    ]);
+
     const seen = new Set<string>();
     return contentControls
       .filter((cc) => (cc.type || "").toLowerCase() === "clause")
@@ -788,6 +886,7 @@ export default function App() {
         );
       })
       .filter((name): name is string => !!name && name.length > 0)
+      .filter((name) => !WORD_PLACEHOLDERS.has(name.toLowerCase().trim()))
       .filter((name) => {
         if (seen.has(name)) return false;
         seen.add(name);
