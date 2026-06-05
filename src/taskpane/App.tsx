@@ -43,6 +43,7 @@ interface Message {
     ccId: number;
     ccName: string;
   };
+  pendingEndReview?: boolean;
 }
 
 interface UpdateAction {
@@ -271,6 +272,10 @@ export default function App() {
       addSystemMessage(`Could not find clause with tag "${action.tag}" to update.`);
       return;
     }
+    if (cc.cannotEdit) {
+      addSystemMessage(`❌ The "${cc.clauseName || cc.tag}" clause is locked for editing (read-only).`);
+      return;
+    }
     try {
       await Word.run(async (context) => {
         const wordCc = context.document.contentControls.getById(cc.id);
@@ -283,11 +288,15 @@ export default function App() {
             await context.sync();
             prevMode = context.document.changeTrackingMode as Word.ChangeTrackingMode;
           } catch { /* proceed */ }
-          context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+          try {
+            context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+          } catch { /* proceed without track changes if doc is protected */ }
           wordCc.insertText(" " + action.replace, "End");
           await context.sync();
-          context.document.changeTrackingMode = prevMode;
-          await context.sync();
+          try {
+            context.document.changeTrackingMode = prevMode;
+            await context.sync();
+          } catch { /* ignore restore failure */ }
           addSystemMessage(`✅ Tracked change: appended "${action.replace}" to "${cc.clauseName || cc.tag}"`);
           refreshContentControls();
           return;
@@ -340,39 +349,57 @@ export default function App() {
     setMessages(prev => prev.map(m =>
       m.id === msgId ? { ...m, pendingEdit: undefined, text: `⏳ Applying tracked change in "${pending.ccName}"…` } : m
     ));
+
+    // Guard: check if the CC is locked before hitting the Word API
+    const pendingCc = contentControls.find((c) => c.id === pending.ccId);
+    if (pendingCc?.cannotEdit) {
+      setMessages(prev => prev.map(m =>
+        m.id === msgId ? { ...m, text: `❌ "${pending.ccName}" is locked for editing (read-only).` } : m
+      ));
+      return;
+    }
+
     try {
       await Word.run(async (context) => {
-        // Read the document's current tracking mode so we can restore it after.
-        // Fallback to off if inaccessible (e.g. protected doc).
+        // Step 1: Try to enable track changes.
+        // In Office.js, property setters are queued and errors fire on context.sync().
+        // In Conga review mode the document has trackedChanges protection — Word already
+        // tracks every edit, but setting changeTrackingMode throws GeneralException.
+        // We detect this by syncing immediately after the setter; if it throws we
+        // skip the restore step and let the document’s own protection handle tracking.
         let prevMode: Word.ChangeTrackingMode = Word.ChangeTrackingMode.off;
+        let trackingChanged = false;
         try {
           context.document.load("changeTrackingMode");
           await context.sync();
           prevMode = context.document.changeTrackingMode as Word.ChangeTrackingMode;
+          if (prevMode !== Word.ChangeTrackingMode.trackAll) {
+            context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+            await context.sync(); // throws GeneralException if doc is review-protected
+            trackingChanged = true;
+          }
         } catch {
-          // proceed with default
+          // Document is already in a tracked-changes protection mode — proceed as-is.
+          // Word will automatically track the edit under the document’s own protection.
+          trackingChanged = false;
         }
 
-        // Enable track changes so Word records the edit as a redline
-        context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
-
+        // Step 2: Apply the edit.
         const wordCc = context.document.contentControls.getById(pending.ccId);
 
         if (pending.action.find.length > 200) {
-          // Full rewrite — find text is too long for Word's search API.
-          // Replace the entire content control content instead.
+          // Full rewrite — find text is too long for Word’s search API.
           wordCc.insertText(pending.action.replace, "Replace");
         } else {
-          // Ranged replace — only the matched text is changed; surrounding
-          // formatting (bold, italics, font size) is preserved.
+          // Ranged replace — only the matched text is changed.
           const searchResults = wordCc.search(pending.action.find, { matchCase: false, matchWholeWord: false });
           searchResults.load("items/text");
           await context.sync();
 
           if (searchResults.items.length === 0) {
-            // Restore original mode before returning
-            context.document.changeTrackingMode = prevMode;
-            await context.sync();
+            if (trackingChanged) {
+              try { context.document.changeTrackingMode = prevMode; await context.sync(); } catch { /* ignore */ }
+            }
             setMessages(prev => prev.map(m =>
               m.id === msgId ? { ...m, text: `❌ Could not find "${pending.action.find}" in "${pending.ccName}".` } : m
             ));
@@ -384,14 +411,15 @@ export default function App() {
 
         await context.sync();
 
-        // Restore original mode — if doc was already in trackAll, it stays that way
-        context.document.changeTrackingMode = prevMode;
-        await context.sync();
+        // Step 3: Restore original tracking mode only if we changed it.
+        if (trackingChanged) {
+          try { context.document.changeTrackingMode = prevMode; await context.sync(); } catch { /* ignore */ }
+        }
       });
 
       setMessages(prev => prev.map(m =>
         m.id === msgId
-          ? { ...m, text: `✅ Tracked change applied in "${pending.ccName}" — accept or reject in Word’s Review ribbon.` }
+          ? { ...m, text: `✅ Change applied in "${pending.ccName}" — accept or reject in Word’s Review ribbon.` }
           : m
       ));
       refreshContentControls();
@@ -408,6 +436,33 @@ export default function App() {
     setMessages(prev => prev.map(m =>
       m.id === msgId ? { ...m, pendingEdit: undefined, text: `✕ Edit cancelled for "${ccName}".` } : m
     ));
+  };
+
+  // ── End Review confirmation card ──────────────────────────────────────────
+
+  const confirmEndReview = async (msgId: string) => {
+    // Remove the confirmation card immediately — endReview() posts its own status messages.
+    setMessages(prev => prev.filter(m => m.id !== msgId));
+    await endReview();
+  };
+
+  const cancelEndReview = (msgId: string) => {
+    setMessages(prev => prev.map(m =>
+      m.id === msgId ? { ...m, pendingEndReview: false, text: `✕ End review cancelled.` } : m
+    ));
+  };
+
+  // Shared helper — used by both the static button and the chat action
+  const showEndReviewConfirm = () => {
+    setMessages(prev => [
+      ...prev,
+      {
+        id: `endreview-${Date.now()}`,
+        role: "system" as const,
+        text: "Are you sure you want to end the review? This will submit your review and cannot be undone.",
+        pendingEndReview: true
+      }
+    ]);
   };
 
   // ── End Review (direct API call) ─────────────────────────────────────────
@@ -637,7 +692,7 @@ export default function App() {
 
         for (const part of parts) {
           if (!part.startsWith("data: ")) continue;
-          let event: { type: string; text?: string; reply?: string; threadId?: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; message?: string };
+          let event: { type: string; text?: string; reply?: string; threadId?: string; contentControlId?: number; navigateTo?: string; updateAction?: UpdateAction; insertAction?: InsertAction; endReviewAction?: boolean; message?: string };
           try { event = JSON.parse(part.slice(6)); } catch { continue; }
 
           if (event.type === "token") {
@@ -679,6 +734,10 @@ export default function App() {
             if (event.contentControlId) await navigateToClause(event.contentControlId);
             if (event.updateAction)     await updateClause(event.updateAction);
             if (event.insertAction)     await insertClause(event.insertAction);
+            if (event.endReviewAction) {
+              // Show confirmation card instead of acting immediately
+              showEndReviewConfirm();
+            }
 
           } else if (event.type === "error") {
             const errText = event.message ?? "An error occurred. Please try again.";
@@ -954,6 +1013,21 @@ export default function App() {
                 </React.Fragment>
               ))}
             </div>
+            {/* ── Pending end-review confirmation card ── */}
+            {msg.pendingEndReview && (
+              <div className="pending-edit">
+                <div className="pending-edit-actions">
+                  <button
+                    className="pending-confirm-btn"
+                    onClick={() => confirmEndReview(msg.id)}
+                  >✅ Yes, end review</button>
+                  <button
+                    className="pending-cancel-btn"
+                    onClick={() => cancelEndReview(msg.id)}
+                  >✕ Cancel</button>
+                </div>
+              </div>
+            )}
             {/* ── Pending edit diff + confirm/cancel buttons ── */}
             {msg.pendingEdit && (
               <div className="pending-edit">
@@ -1001,7 +1075,7 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className="quick-actions">
-        <button onClick={endReview} disabled={endReviewLoading}>
+        <button onClick={showEndReviewConfirm} disabled={endReviewLoading}>
           {endReviewLoading ? "⏳ Ending…" : "End Review"}
         </button>
         <button
