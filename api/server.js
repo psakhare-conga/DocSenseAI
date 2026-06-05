@@ -722,7 +722,9 @@ Your job:
 5. If the user asks to insert or add a BRAND NEW clause or section to the document, include:
    {"action":"insert","tag":"<new clause name>","text":"<full text of the new clause>"}
 6. If the user asks to list clauses or fields, list them clearly.
-7. Be concise. Do not hallucinate content not present in the document.
+7. If the user asks to end the review, finish the review, submit the review, or complete the review, include:
+   {"action":"endReview"}
+8. Be concise. Do not hallucinate content not present in the document.
 
 IMPORTANT — Conga API tools:
 • Authentication (Authorization header, ExternalToken) is handled AUTOMATICALLY by the server. NEVER ask the user for tokens, credentials, client_id, client_secret, or any auth details.
@@ -1040,6 +1042,9 @@ app.post("/api/chat", async (req, res) => {
       if (action?.action === "insert") {
         response.insertAction = { tag: action.tag, text: action.text };
       }
+      if (action?.action === "endReview") {
+        response.endReviewAction = true;
+      }
 
       logger.info("CHAT_RES", {
         message: `Chat response [${reqId}]`,
@@ -1165,6 +1170,9 @@ app.post("/api/chat", async (req, res) => {
       if (action?.action === "insert") {
         response.insertAction = { tag: action.tag, text: action.text };
       }
+      if (action?.action === "endReview") {
+        response.endReviewAction = true;
+      }
 
       return res.json(response);
 
@@ -1206,6 +1214,10 @@ app.post("/api/chat", async (req, res) => {
       updateAction: { tag: updateMatch[1], find: updateMatch[2], replace: updateMatch[3] },
       threadId
     });
+  }
+
+  if (/end.{0,10}review|finish.{0,10}review|submit.{0,10}review|complete.{0,10}review/i.test(msg)) {
+    return res.json({ reply: "Ending the review…", endReviewAction: true, threadId });
   }
 
   res.json({
@@ -1423,6 +1435,9 @@ app.post("/api/chat/stream", async (req, res) => {
       if (action?.action === "insert") {
         done.insertAction = { tag: action.tag, text: action.text };
       }
+      if (action?.action === "endReview") {
+        done.endReviewAction = true;
+      }
 
       sendEvent(done);
       endStream();
@@ -1473,6 +1488,9 @@ app.post("/api/chat/stream", async (req, res) => {
       if (action?.action === "insert") {
         done.insertAction = { tag: action.tag, text: action.text };
       }
+      if (action?.action === "endReview") {
+        done.endReviewAction = true;
+      }
 
       sendEvent(done);
       endStream();
@@ -1491,6 +1509,11 @@ app.post("/api/chat/stream", async (req, res) => {
   let fallbackReply = `⚠️ Azure OpenAI is not configured. Add your keys to api/.env to enable AI responses.\n\nKeyword mode — try:\n• "List all clauses"\n• "Find the payment clause"`;
   if (msg_lc.includes("list") || msg_lc.includes("all clause") || msg_lc.includes("show clause")) {
     fallbackReply = formatClauseList(contentControls);
+  }
+  if (/end.{0,10}review|finish.{0,10}review|submit.{0,10}review|complete.{0,10}review/i.test(msg_lc)) {
+    sendEvent({ type: "done", reply: "Ending the review…", endReviewAction: true, threadId });
+    endStream();
+    return;
   }
   sendEvent({ type: "done", reply: fallbackReply, threadId });
   endStream();
